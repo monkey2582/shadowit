@@ -1067,8 +1067,11 @@
                         }
                     }
                     for (var bi = 0; bi < newAttrs.length; bi++) {
-                        if (oc.getAttribute(newAttrs[bi].name) !== newAttrs[bi].value) {
-                            oc.setAttribute(newAttrs[bi].name, newAttrs[bi].value);
+                        var attrName = newAttrs[bi].name;
+                        // 跳过事件绑定语法（@click 等），由事件委托系统处理
+                        if (attrName.charAt(0) === '@') continue;
+                        if (oc.getAttribute(attrName) !== newAttrs[bi].value) {
+                            oc.setAttribute(attrName, newAttrs[bi].value);
                         }
                     }
                     // 递归 diff 子节点，而不是 innerHTML 替换
@@ -1916,7 +1919,7 @@
                 onError: onError, eventsOnHost: eventsOnHost,
                 lifecycle: {
                     beforeRender: lifecycle.beforeRender ? function() { lifecycle.beforeRender.call(self); } : null,
-                    afterRender: function(data) { if (lifecycle.afterRender) lifecycle.afterRender.call(self, data); },
+                    afterRender: function() { if (lifecycle.afterRender) lifecycle.afterRender.call(self, shadowitInst._data); },
                     beforeUpdate: lifecycle.beforeUpdate ? function(newData, oldData) { lifecycle.beforeUpdate.call(self, newData, oldData); } : null,
                     afterUpdate: lifecycle.afterUpdate ? function(newData, currentData) { lifecycle.afterUpdate.call(self, newData, currentData); } : null,
                     destroy: function() { if (lifecycle.destroy) lifecycle.destroy.call(self); }
