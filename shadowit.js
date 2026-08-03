@@ -1,13 +1,13 @@
 /**
- * shadowit - Shadow DOM 控制库 v0.12.0
- * 支持 #for of 语法、#else/#else-if 分支、{{--注释--}}、
- * {{#show}} 条件显示、{{#once}} 一次性渲染、@事件 模板内绑定、
- * 嵌套模板解析、缓存自动失效、批处理更新、延迟挂载、
- * 无模板自动包裹、MutationObserver 自动挂载、
- * copy/paste 复制粘贴、scan 扫描挂载、remove/removeAll 清除、
- * 接管原生 ShadowDOM、qS/qSAll 带缓存查询
+ * shadowit - Shadow DOM 控制库 v1.4.0
+ * #for of + keyed diff、#else/#else-if/#elseif、{{--注释--}}、
+ * {{#show}}、{{#once}}、事件委托 @click="handler(args)"、
+ * 原生 <slot> 兼容、shouldUpdate 钩子、css 函数支持、
+ * WeakMap 实例管理、takeOver 开关、
+ * @bind 双向绑定、computed 计算属性、Proxy 深响应式、
+ * #await 异步块、#portal 传送门
  * https://github.com/monkey2582/shadowit
- * @version 0.12.0
+ * @version 1.4.1
  */
 (function (global, factory) {
     if (typeof module === 'object' && typeof module.exports === 'object') {
@@ -23,38 +23,34 @@
 }(typeof window !== 'undefined' ? window : this, function () {
     'use strict';
 
-    // ============================================================
-    // 环境检测
-    // ============================================================
-    const isSupported = () => {
+    var isSupported = function() {
         return !!(document.createElement('div').attachShadow && window.customElements);
     };
 
     // ============================================================
     // 工具函数
     // ============================================================
-    const utils = {
-        isObject(val) { return val !== null && typeof val === 'object' && !Array.isArray(val); },
-        isFunction(val) { return typeof val === 'function'; },
-        isString(val) { return typeof val === 'string'; },
-        isArray(val) { return Array.isArray(val); },
+    var utils = {
+        isObject: function(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); },
+        isFunction: function(v) { return typeof v === 'function'; },
+        isString: function(v) { return typeof v === 'string'; },
+        isArray: function(v) { return Array.isArray(v); },
 
-        deepClone(obj) {
+        deepClone: function(obj) {
             if (!utils.isObject(obj) && !utils.isArray(obj)) return obj;
-            const copy = utils.isArray(obj) ? [] : {};
-            for (const key in obj) {
+            var copy = utils.isArray(obj) ? [] : {};
+            for (var key in obj) {
                 if (Object.prototype.hasOwnProperty.call(obj, key)) {
                     copy[key] = utils.isObject(obj[key]) || utils.isArray(obj[key]) ?
-                        utils.deepClone(obj[key]) :
-                        obj[key];
+                        utils.deepClone(obj[key]) : obj[key];
                 }
             }
             return copy;
         },
 
-        merge(target, source) {
+        merge: function(target, source) {
             if (!utils.isObject(target) || !utils.isObject(source)) return target;
-            for (const key in source) {
+            for (var key in source) {
                 if (Object.prototype.hasOwnProperty.call(source, key)) {
                     target[key] = source[key];
                 }
@@ -62,510 +58,585 @@
             return target;
         },
 
-        getNested(obj, path) {
+        getNested: function(obj, path) {
             if (!obj || !path) return undefined;
-            const keys = path.split('.');
-            let result = obj;
-            for (const key of keys) {
+            var keys = path.split('.');
+            var result = obj;
+            for (var i = 0; i < keys.length; i++) {
                 if (result === undefined || result === null) return undefined;
-                result = result[key];
+                result = result[keys[i]];
             }
             return result;
         },
 
-        uid() {
+        uid: function() {
             return 'si-' + Date.now() + '-' + Math.random().toString(36).substr(2, 8);
         },
 
-        // 判断字符串是否为 CSS 代码（包含 { ; 或换行）
-        isCSS(str) {
+        isCSS: function(str) {
             if (!utils.isString(str)) return false;
             return /[{};]|\n/.test(str);
         },
 
-        // 判断是否为有效选择器（能匹配到元素）
-        isSelector(str) {
-            if (!utils.isString(str)) return false;
-            try {
-                return !!document.querySelector(str);
-            } catch (e) {
-                return false;
-            }
-        },
-
-        // 解析 Root 参数：不是 selector 或 element 就默认 document.documentElement
-        resolveRoot(root) {
+        resolveRoot: function(root) {
             if (!root) return document.documentElement;
             if (root instanceof Element || root === document || root instanceof DocumentFragment) return root;
-            if (root.nodeType === 11) return root; // ShadowRoot
+            if (root.nodeType === 11) return root;
             if (utils.isString(root)) {
-                try {
-                    const el = document.querySelector(root);
-                    if (el) return el;
-                } catch (e) { /* ignore */ }
+                try { var el = document.querySelector(root); if (el) return el; } catch (e) {}
             }
             return document.documentElement;
         },
 
-        // 解析宿主元素
-        resolveHost(host) {
+        resolveHost: function(host) {
             if (!host) return null;
             if (host instanceof Element) return host;
             if (utils.isString(host)) {
-                try {
-                    return document.querySelector(host);
-                } catch (e) {
-                    return null;
-                }
+                try { return document.querySelector(host); } catch (e) { return null; }
             }
             return null;
         },
 
-        // 去除 {{-- 注释 --}}
-        stripComments(template) {
+        stripComments: function(template) {
             if (!template) return '';
             return template.replace(/\{\{--[\s\S]*?--\}\}/g, '');
         },
 
-        // 安全插值
-        interpolate(template, data) {
+        // 查找 }} 闭合标记，跳过字符串字面量内的 }}（避免误匹配）
+        _findClosingBraces: function(template, startPos) {
+            var inSingle = false, inDouble = false;
+            for (var i = startPos; i < template.length - 1; i++) {
+                var ch = template[i];
+                if (ch === '\\') { i++; continue; } // 跳过转义字符
+                if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
+                if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
+                if (!inSingle && !inDouble && ch === '}' && template[i + 1] === '}') {
+                    return i;
+                }
+            }
+            return -1;
+        },
+
+        escapeHtml: function(str) {
+            if (str === undefined || str === null) return '';
+            return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        },
+
+        // ============================================================
+        // 纯路径条件求值 — 零 eval，零 XSS 风险
+        // ============================================================
+        evalCondition: function(expr, data) {
+            if (!expr) return false;
+            expr = expr.trim();
+            if (expr.charAt(0) === '!') return !utils.evalCondition(expr.slice(1).trim(), data);
+            if (expr.charAt(0) === '(' && expr.charAt(expr.length - 1) === ')') {
+                return utils.evalCondition(expr.slice(1, -1).trim(), data);
+            }
+            var andIdx = expr.indexOf('&&');
+            if (andIdx > -1) {
+                return utils.evalCondition(expr.slice(0, andIdx).trim(), data) &&
+                    utils.evalCondition(expr.slice(andIdx + 2).trim(), data);
+            }
+            var orIdx = expr.indexOf('||');
+            if (orIdx > -1) {
+                return utils.evalCondition(expr.slice(0, orIdx).trim(), data) ||
+                    utils.evalCondition(expr.slice(orIdx + 2).trim(), data);
+            }
+            var cmpMatch = expr.match(/^([a-zA-Z_$][\w.$]*)\s*(===|!==|==|!=|>=|<=|>|<)\s*(.+)$/);
+            if (cmpMatch) {
+                var lhs = utils.getNested(data, cmpMatch[1]);
+                var op = cmpMatch[2];
+                var rhs;
+                var rhsRaw = cmpMatch[3].trim();
+                if ((rhsRaw.charAt(0) === '"' && rhsRaw.charAt(rhsRaw.length - 1) === '"') ||
+                    (rhsRaw.charAt(0) === "'" && rhsRaw.charAt(rhsRaw.length - 1) === "'")) {
+                    rhs = rhsRaw.slice(1, -1);
+                } else if (rhsRaw === 'true') { rhs = true; }
+                else if (rhsRaw === 'false') { rhs = false; }
+                else if (rhsRaw === 'null' || rhsRaw === 'undefined') { rhs = null; }
+                else if (/^-?\d+(\.\d+)?$/.test(rhsRaw)) { rhs = parseFloat(rhsRaw); }
+                else if (/^[a-zA-Z_$][\w.$]*$/.test(rhsRaw)) { rhs = utils.getNested(data, rhsRaw); }
+                else { return false; }
+                switch (op) {
+                    case '===': return lhs === rhs;
+                    case '!==': return lhs !== rhs;
+                    case '==':  return lhs == rhs;
+                    case '!=':  return lhs != rhs;
+                    case '>=':  return lhs >= rhs;
+                    case '<=':  return lhs <= rhs;
+                    case '>':   return lhs > rhs;
+                    case '<':   return lhs < rhs;
+                    default:    return false;
+                }
+            }
+            if (/^[a-zA-Z_$][\w.$]*$/.test(expr)) return !!utils.getNested(data, expr);
+            return false;
+        },
+
+        // ============================================================
+        // 栈式模板解析器
+        // ============================================================
+        parseTemplate: function(template, data, onceCache, pendingPromises) {
             if (!template) return '';
+            onceCache = onceCache || {};
+            pendingPromises = pendingPromises || null;
             template = utils.stripComments(template);
-            return template.replace(/\{\{([^}]+)\}\}/g, (match, expr) => {
-                const trimmed = expr.trim();
-                if (/^[a-zA-Z_$][\w.$]*$/.test(trimmed)) {
-                    const value = utils.getNested(data, trimmed);
-                    return value !== undefined && value !== null ? String(value) : '';
-                }
-                return '';
-            });
-        },
+            var pos = 0, len = template.length, result = '';
+            while (pos < len) {
+                var openIdx = template.indexOf('{{', pos);
+                if (openIdx === -1) { result += template.slice(pos); break; }
+                result += template.slice(pos, openIdx);
+                var closeIdx = utils._findClosingBraces(template, openIdx + 2);
+                if (closeIdx === -1) { result += template.slice(openIdx); break; }
+                var tag = template.slice(openIdx + 2, closeIdx).trim();
+                pos = closeIdx + 2;
 
-        // 安全逻辑求值 (#if)
-        safeEvalIf(expr, data) {
-            const sanitized = expr.replace(/[^a-zA-Z0-9_.$&|!()\s]/g, '');
-            const pathRegex = /[a-zA-Z_$][\w.$]*/g;
-            const tokens = sanitized.match(pathRegex) || [];
-            const values = {};
-            tokens.forEach(token => {
-                if (!/^(true|false|null|undefined)$/.test(token)) {
-                    values[token] = utils.getNested(data, token);
+                // #if
+                if (tag.indexOf('#if ') === 0 || tag === '#if') {
+                    var ifCond = tag.indexOf('#if ') === 0 ? tag.slice(4).trim() : '';
+                    var inner = utils._extractBlock(template, pos, '#if', '/if');
+                    pos = inner.nextPos;
+                    var rendered = '';
+                    if (ifCond) {
+                        var branches = utils._splitIfBranches(inner.content);
+                        for (var bi = 0; bi < branches.length; bi++) {
+                            if (branches[bi].condition === null || utils.evalCondition(branches[bi].condition, data)) {
+                                rendered = utils.parseTemplate(branches[bi].content, data, onceCache, pendingPromises);
+                                break;
+                            }
+                        }
+                    } else {
+                        rendered = utils.parseTemplate(inner.content, data, onceCache, pendingPromises);
+                    }
+                    result += rendered;
+                    continue;
                 }
-            });
-            let code = sanitized;
-            for (const key in values) {
-                const val = values[key];
-                const repl = JSON.stringify(val);
-                code = code.replace(new RegExp('\\b' + key + '\\b', 'g'), repl);
-            }
-            try {
-                const fn = new Function('return !!(' + code + ')');
-                return fn();
-            } catch (e) {
-                return false;
-            }
-        },
-
-        // 获取父级数据
-        getParentData(data, levels) {
-            let result = data;
-            for (let i = 0; i < levels; i++) {
-                if (result && result.parent) {
-                    result = result.parent;
-                } else {
-                    return undefined;
+                // #for
+                if (tag.indexOf('#for ') === 0) {
+                    var forExpr = tag.slice(5).trim();
+                    var forMatch = forExpr.match(/^(\w+)\s+of\s+([\w.]+)(?:\s+key\s*=\s*"([^"]*)")?\s*$/);
+                    var forInner = utils._extractBlock(template, pos, '#for', '/for');
+                    pos = forInner.nextPos;
+                    if (forMatch) {
+                        var items = utils.getNested(data, forMatch[2]);
+                        var itemName = forMatch[1];
+                        var trackKey = forMatch[3] || null;
+                        if (utils.isArray(items) && items.length > 0) {
+                            for (var fi = 0; fi < items.length; fi++) {
+                                var listItem = items[fi];
+                                var ctx = {};
+                                for (var dk in data) { if (data.hasOwnProperty(dk)) ctx[dk] = data[dk]; }
+                                ctx.index = fi; ctx.parent = data; ctx[itemName] = listItem;
+                                var keyVal = '__idx_' + fi;
+                                if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
+                                ctx['@key'] = keyVal;
+                                var itemRendered = utils.parseTemplate(forInner.content, ctx, onceCache, pendingPromises);
+                                result += '<shadowit-key data-key="' + keyVal + '">' + itemRendered + '</shadowit-key>';
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // #show
+                if (tag.indexOf('#show ') === 0) {
+                    var showExpr = tag.slice(6).trim();
+                    var showVal = utils.evalCondition(showExpr, data);
+                    var showInner = utils._extractBlock(template, pos, '#show', '/show');
+                    pos = showInner.nextPos;
+                    var showContent = utils.parseTemplate(showInner.content, data, onceCache, pendingPromises);
+                    result += showVal ? showContent : '<shadowit-key style="display:none">' + showContent + '</shadowit-key>';
+                    continue;
+                }
+                // #once
+                if (tag === '#once') {
+                    var onceKey = 'once_' + openIdx;
+                    var onceInner = utils._extractBlock(template, pos, '#once', '/once');
+                    pos = onceInner.nextPos;
+                    if (onceCache[onceKey]) { result += onceCache[onceKey]; }
+                    else {
+                        var onceRendered = utils.parseTemplate(onceInner.content, data, onceCache, pendingPromises);
+                        onceCache[onceKey] = onceRendered;
+                        result += onceRendered;
+                    }
+                    continue;
+                }
+                // #await
+                if (tag.indexOf('#await ') === 0) {
+                    var awaitExpr = tag.slice(7).trim();
+                    var awaitInner = utils._extractBlock(template, pos, '#await', '/await');
+                    pos = awaitInner.nextPos;
+                    var awaitParts = utils._splitAwaitBranches(awaitInner.content);
+                    var awaitVal = utils.getNested(data, awaitExpr);
+                    if (awaitVal && typeof awaitVal.then === 'function') {
+                        // 是 Promise：渲染 loading 状态，注册回调
+                        result += utils.parseTemplate(awaitParts.loading, data, onceCache, pendingPromises);
+                        if (pendingPromises) {
+                            pendingPromises.push({
+                                promise: awaitVal,
+                                thenContent: awaitParts.then,
+                                thenVar: awaitParts.thenVar,
+                                catchContent: awaitParts.catch,
+                                catchVar: awaitParts.catchVar
+                            });
+                        }
+                    } else if (awaitVal !== undefined && awaitVal !== null) {
+                        // 已解析：渲染 then 分支
+                        var thenCtx = {};
+                        for (var tdk in data) { if (data.hasOwnProperty(tdk)) thenCtx[tdk] = data[tdk]; }
+                        if (awaitParts.thenVar) thenCtx[awaitParts.thenVar] = awaitVal;
+                        result += utils.parseTemplate(awaitParts.then, thenCtx, onceCache, pendingPromises);
+                    } else {
+                        result += utils.parseTemplate(awaitParts.loading, data, onceCache, pendingPromises);
+                    }
+                    continue;
+                }
+                // #portal
+                if (tag.indexOf('#portal') === 0) {
+                    var portalSelectorMatch = tag.match(/^#portal\s+selector\s*=\s*"([^"]*)"$/);
+                    var portalInner = utils._extractBlock(template, pos, '#portal', '/portal');
+                    pos = portalInner.nextPos;
+                    var portalContent = utils.parseTemplate(portalInner.content, data, onceCache, pendingPromises);
+                    if (portalSelectorMatch) {
+                        result += '<shadowit-portal data-selector="' + utils.escapeHtml(portalSelectorMatch[1]) + '">' + portalContent + '</shadowit-portal>';
+                    }
+                    continue;
+                }
+                // 普通插值
+                if (/^[a-zA-Z_$][\w.$]*$/.test(tag)) {
+                    var value = utils.getNested(data, tag);
+                    result += value !== undefined && value !== null ? utils.escapeHtml(value) : '';
+                } else if (/^\.\.\//.test(tag)) {
+                    var parts = tag.split('/'), levels = 0, path = '';
+                    for (var pi = 0; pi < parts.length; pi++) {
+                        if (parts[pi] === '..') levels++; else { path = parts[pi]; break; }
+                    }
+                    var parentData = utils.getParentData(data, levels);
+                    if (parentData) {
+                        var pval = utils.getNested(parentData, path);
+                        result += pval !== undefined && pval !== null ? utils.escapeHtml(pval) : '';
+                    }
                 }
             }
             return result;
         },
 
-        // 拆分 #if 块中的 #else / #else-if 分支
-        _splitIfBranches(content) {
-            const markers = [];
-            const regex = /\{\{#else(?:\s+if\s+([^}]+))?\}\}/g;
-            let match;
+        _extractBlock: function(template, startPos, blockType, closeType) {
+            var depth = 1, pos = startPos, len = template.length;
+            var openTag = '{{#' + blockType, closeTag = '{{/' + closeType + '}}';
+            while (pos < len && depth > 0) {
+                var nextOpen = template.indexOf(openTag, pos);
+                var nextClose = template.indexOf(closeTag, pos);
+                if (nextClose === -1) return { content: template.slice(startPos), nextPos: len };
+                if (nextOpen > -1 && nextOpen < nextClose) { depth++; pos = nextOpen + openTag.length; }
+                else {
+                    depth--;
+                    if (depth === 0) return { content: template.slice(startPos, nextClose), nextPos: nextClose + closeTag.length };
+                    pos = nextClose + closeTag.length;
+                }
+            }
+            return { content: template.slice(startPos), nextPos: len };
+        },
+
+        _splitIfBranches: function(content) {
+            var markers = [], regex = /\{\{#else\s*(?:if\s*\(?\s*([^})]+)\s*\)?)?\}\}/g, match;
             while ((match = regex.exec(content)) !== null) {
-                markers.push({
-                    index: match.index,
-                    endIndex: match.index + match[0].length,
-                    condition: match[1] ? match[1].trim() : null,
-                    full: match[0]
-                });
+                markers.push({ index: match.index, endIndex: match.index + match[0].length, condition: match[1] ? match[1].trim() : null });
             }
-            if (markers.length === 0) {
-                return [{ condition: null, content: content }];
-            }
-            const branches = [];
-            branches.push({ condition: null, content: content.substring(0, markers[0].index) });
-            for (let i = 0; i < markers.length; i++) {
-                const start = markers[i].endIndex;
-                const end = i < markers.length - 1 ? markers[i + 1].index : content.length;
-                branches.push({
-                    condition: markers[i].condition,
-                    content: content.substring(start, end)
-                });
+            if (markers.length === 0) return [{ condition: null, content: content }];
+            var branches = [{ condition: null, content: content.substring(0, markers[0].index) }];
+            for (var i = 0; i < markers.length; i++) {
+                var start = markers[i].endIndex;
+                var end = i < markers.length - 1 ? markers[i + 1].index : content.length;
+                branches.push({ condition: markers[i].condition, content: content.substring(start, end) });
             }
             return branches;
         },
 
-        // 增强的块解析
-        parseBlocks(template, data, level, onceCache) {
-            if (!template) return '';
-            level = level || 0;
-            onceCache = onceCache || {};
-            var blockRegex = /\{\{#(each|if|for|show|once)\s*([^}]*)}\}([\s\S]*?)\{\{\/\1\}\}/g;
-            let result = template;
-            let match;
-            const blocks = [];
-            while ((match = blockRegex.exec(template)) !== null) {
-                blocks.push({
-                    full: match[0],
+        getParentData: function(data, levels) {
+            var result = data;
+            for (var i = 0; i < levels; i++) {
+                if (result && result.parent) result = result.parent; else return undefined;
+            }
+            return result;
+        },
+
+        // 设置嵌套属性值（用于 @bind 双向绑定回写）
+        // 路径中间若为 null/undefined 或非对象，则停止，避免覆盖数据
+        _setNested: function(obj, path, value) {
+            if (!obj || !path) return;
+            var keys = path.split('.');
+            var last = keys.pop();
+            var target = obj;
+            for (var i = 0; i < keys.length; i++) {
+                var cur = target[keys[i]];
+                if (cur === null || cur === undefined) {
+                    // 中间路径不存在，创建空对象继续
+                    target[keys[i]] = {};
+                } else if (!utils.isObject(cur)) {
+                    // 中间路径是原始值（字符串、数字等），不予覆盖，停止写入
+                    console.warn('[shadowit] @bind 路径 "' + path + '" 在 "' + keys[i] + '" 处不是对象，无法写入。');
+                    return;
+                }
+                target = target[keys[i]];
+            }
+            target[last] = value;
+        },
+
+        // 分割 #await 分支：{{:then varname}}...{{:catch varname}}...{{:loading}}...
+        // 或 {{:then}}...{{/await}}
+        _splitAwaitBranches: function(content) {
+            var result = { loading: '', then: '', thenVar: null, catch: '', catchVar: null };
+            // 匹配 :then、:catch、:loading 分支标记
+            var branchRe = /\{\{:(then|catch|loading)(?:\s+(\w+))?\}\}/g;
+            var markers = [];
+            var match;
+            while ((match = branchRe.exec(content)) !== null) {
+                markers.push({
+                    index: match.index,
+                    endIndex: match.index + match[0].length,
                     type: match[1],
-                    key: match[2].trim(),
-                    content: match[3],
-                    index: match.index
+                    varName: match[2] || null
                 });
             }
-            for (let i = blocks.length - 1; i >= 0; i--) {
-                const block = blocks[i];
-                if (block.type === 'for') {
-                    const forMatch = block.key.match(/^(\w+)\s+of\s+([\w.]+)(?:\s+key\s*=\s*"([^"]*)")?\s*$/);
-                    if (forMatch) {
-                        const itemName = forMatch[1];
-                        const itemsPath = forMatch[2];
-                        const trackKey = forMatch[3] || null;
-                        const items = utils.getNested(data, itemsPath);
-                        if (utils.isArray(items) && items.length > 0) {
-                            let rendered = '';
-                            for (let idx = 0; idx < items.length; idx++) {
-                                const listItem = items[idx];
-                                const ctx = { ...data, index: idx, parent: data };
-                                ctx[itemName] = listItem;
-                                let keyVal = idx;
-                                if (trackKey) {
-                                    const k = utils.getNested(listItem, trackKey);
-                                    if (k !== undefined) keyVal = k;
-                                }
-                                ctx['@key'] = keyVal;
-                                let itemContent = utils.parseBlocks(block.content, ctx, level + 1, onceCache);
-                                itemContent = utils.interpolateWithContext(itemContent, ctx);
-                                rendered += '<shadowit-key data-key="' + keyVal + '">' + itemContent + '</shadowit-key>';
-                            }
-                            result = result.replace(block.full, rendered);
-                        } else {
-                            result = result.replace(block.full, '');
-                        }
-                    }
-                } else if (block.type === 'each') {
-                    console.warn('[shadowit] #each 语法已废弃，请改用 #for of 语法。示例: {{#for item of items key="id"}}');
-                    let keyExpr = block.key;
-                    let trackKey = null;
-                    const trackMatch = keyExpr.match(/^(.+?)\s+track\s+by\s+([\w.]+)$/);
-                    if (trackMatch) {
-                        keyExpr = trackMatch[1].trim();
-                        trackKey = trackMatch[2].trim();
-                    }
-                    const items = utils.getNested(data, keyExpr);
-                    if (utils.isArray(items) && items.length > 0) {
-                        let rendered = '';
-                        for (let idx = 0; idx < items.length; idx++) {
-                            const listItem = items[idx];
-                            const ctx = { ...data, item: listItem, index: idx, parent: data };
-                            let keyVal = idx;
-                            if (trackKey) {
-                                const k = utils.getNested(listItem, trackKey);
-                                if (k !== undefined) keyVal = k;
-                            }
-                            ctx['@key'] = keyVal;
-                            let itemContent = utils.parseBlocks(block.content, ctx, level + 1, onceCache);
-                            itemContent = utils.interpolateWithContext(itemContent, ctx);
-                            rendered += '<shadowit-key data-key="' + keyVal + '">' + itemContent + '</shadowit-key>';
-                        }
-                        result = result.replace(block.full, rendered);
-                    } else {
-                        result = result.replace(block.full, '');
-                    }
-                } else if (block.type === 'if') {
-                    const branches = utils._splitIfBranches(block.content);
-                    let rendered = '';
-                    for (const branch of branches) {
-                        if (branch.condition === null || utils.safeEvalIf(branch.condition, data)) {
-                            rendered = utils.parseBlocks(branch.content, data, level + 1, onceCache);
-                            break;
-                        }
-                    }
-                    result = result.replace(block.full, rendered);
-                } else if (block.type === 'show') {
-                    // {{#show expr}}...{{/show}} — 条件为假时 display:none
-                    var showVal = utils.safeEvalIf(block.key, data);
-                    var showContent = utils.parseBlocks(block.content, data, level + 1, onceCache);
-                    if (showVal) {
-                        result = result.replace(block.full, showContent);
-                    } else {
-                        result = result.replace(block.full, '<shadowit-key data-key="hidden" style="display:none">' + showContent + '</shadowit-key>');
-                    }
-                } else if (block.type === 'once') {
-                    // {{#once}}...{{/once}} — 只渲染一次，后续用缓存
-                    var cacheKey = 'once_' + block.index;
-                    if (onceCache[cacheKey]) {
-                        result = result.replace(block.full, onceCache[cacheKey]);
-                    } else {
-                        var onceRendered = utils.parseBlocks(block.content, data, level + 1, onceCache);
-                        onceCache[cacheKey] = onceRendered;
-                        result = result.replace(block.full, onceRendered);
-                    }
+            if (markers.length === 0) {
+                // 无分支标记：全部视为 loading 内容
+                result.loading = content;
+                return result;
+            }
+            // 第一个 marker 之前的内容是 loading
+            result.loading = content.substring(0, markers[0].index);
+            for (var i = 0; i < markers.length; i++) {
+                var start = markers[i].endIndex;
+                var end = i < markers.length - 1 ? markers[i + 1].index : content.length;
+                var branchContent = content.substring(start, end);
+                if (markers[i].type === 'then') {
+                    result.then = branchContent;
+                    result.thenVar = markers[i].varName;
+                } else if (markers[i].type === 'catch') {
+                    result.catch = branchContent;
+                    result.catchVar = markers[i].varName;
+                } else if (markers[i].type === 'loading') {
+                    result.loading = branchContent;
                 }
             }
             return result;
         },
 
-        // 带上下文插值
-        interpolateWithContext(template, data) {
+        renderTemplate: function(template, data, onceCache, pendingPromises) {
             if (!template) return '';
-            template = utils.stripComments(template);
-            return template.replace(/\{\{([^}]+)\}\}/g, (match, expr) => {
-                const trimmed = expr.trim();
-                if (/^\.\.\//.test(trimmed)) {
-                    const parts = trimmed.split('/');
-                    let levels = 0;
-                    let path = '';
-                    for (const part of parts) {
-                        if (part === '..') levels++;
-                        else { path = part; break; }
-                    }
-                    const parentData = utils.getParentData(data, levels);
-                    if (parentData) {
-                        const val = utils.getNested(parentData, path);
-                        return val !== undefined && val !== null ? String(val) : '';
-                    }
-                    return '';
-                }
-                if (/^[a-zA-Z_$][\w.$]*$/.test(trimmed)) {
-                    const value = utils.getNested(data, trimmed);
-                    return value !== undefined && value !== null ? String(value) : '';
-                }
-                return '';
-            });
+            return utils.parseTemplate(template, data, onceCache, pendingPromises);
         },
 
-        renderTemplate(template, data, onceCache) {
-            if (!template) return '';
-            template = utils.stripComments(template);
-            let html = utils.parseBlocks(template, data, 0, onceCache);
-            html = utils.interpolate(html, data);
-            return html;
-        },
-
-        createStyleElement(css, id) {
-            const style = document.createElement('style');
-            if (id) style.setAttribute('data-shadowit', id);
-            style.textContent = css;
-            return style;
-        },
-
-        htmlToNodes(html) {
-            const template = document.createElement('template');
-            template.innerHTML = html.trim();
-            return template.content;
-        },
-
-        extractSlots(hostElement) {
-            const slots = {};
-            const children = Array.from(hostElement.children);
-            for (const child of children) {
-                const slotName = child.getAttribute('slot');
-                if (slotName) {
-                    if (!slots[slotName]) slots[slotName] = [];
-                    slots[slotName].push(child.cloneNode(true));
-                    child.remove();
-                }
+        // 解析事件表达式: @click="handler(arg1, arg2)"
+        parseEventExpr: function(expr) {
+            var match = expr.match(/^(\w+)\(([^)]*)\)$/);
+            if (match) {
+                var args = match[2].split(',').map(function(s) {
+                    s = s.trim();
+                    if ((s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') ||
+                        (s.charAt(0) === "'" && s.charAt(s.length - 1) === "'")) {
+                        return s.slice(1, -1);
+                    }
+                    if (s === 'true') return true;
+                    if (s === 'false') return false;
+                    if (s === 'null') return null;
+                    if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+                    return { $path: s };
+                });
+                return { name: match[1], args: args };
             }
-            const defaultChildren = Array.from(hostElement.childNodes)
-                .filter(function(node) { return node.nodeType === 1 || (node.nodeType === 3 && node.textContent.trim()); });
-            if (defaultChildren.length > 0) {
-                slots['default'] = defaultChildren.map(function(node) { return node.cloneNode(true); });
-            }
-            return slots;
-        },
-
-        // 精细 diff
-        patchDom(oldNode, newNode) {
-            if (oldNode.nodeType !== newNode.nodeType) {
-                oldNode.parentNode.replaceChild(newNode, oldNode);
-                return;
-            }
-            if (oldNode.nodeType === Node.TEXT_NODE) {
-                if (oldNode.textContent !== newNode.textContent) {
-                    oldNode.textContent = newNode.textContent;
-                }
-                return;
-            }
-            if (oldNode.nodeType === Node.ELEMENT_NODE) {
-                if (oldNode.tagName === 'SHADOWIT-KEY' && newNode.tagName === 'SHADOWIT-KEY') {
-                    var oldKey = oldNode.getAttribute('data-key');
-                    var newKey = newNode.getAttribute('data-key');
-                    if (oldKey !== newKey) {
-                        oldNode.parentNode.replaceChild(newNode.cloneNode(true), oldNode);
-                        return;
-                    }
-                    var oldChild = oldNode.firstChild;
-                    var newChild = newNode.firstChild;
-                    if (oldChild && newChild) {
-                        utils.patchDom(oldChild, newChild);
-                    } else if (!oldChild && newChild) {
-                        oldNode.appendChild(newChild.cloneNode(true));
-                    } else if (oldChild && !newChild) {
-                        oldNode.removeChild(oldChild);
-                    }
-                    return;
-                }
-                var oldAttrs = oldNode.attributes;
-                var newAttrs = newNode.attributes;
-                for (var ai = 0; ai < oldAttrs.length; ai++) {
-                    var attr = oldAttrs[ai];
-                    if (!newNode.hasAttribute(attr.name)) {
-                        oldNode.removeAttribute(attr.name);
-                    }
-                }
-                for (var bi = 0; bi < newAttrs.length; bi++) {
-                    var nattr = newAttrs[bi];
-                    if (oldNode.getAttribute(nattr.name) !== nattr.value) {
-                        oldNode.setAttribute(nattr.name, nattr.value);
-                    }
-                }
-                if (oldNode.tagName !== newNode.tagName) {
-                    oldNode.parentNode.replaceChild(newNode.cloneNode(true), oldNode);
-                    return;
-                }
-                var oldChildren = Array.from(oldNode.childNodes);
-                var newChildren = Array.from(newNode.childNodes);
-                var oldKeys = oldChildren.filter(function(c) { return c.nodeType === 1 && c.tagName === 'SHADOWIT-KEY'; });
-                var newKeys = newChildren.filter(function(c) { return c.nodeType === 1 && c.tagName === 'SHADOWIT-KEY'; });
-                if (oldKeys.length > 0 || newKeys.length > 0) {
-                    var keyMap = new Map();
-                    oldKeys.forEach(function(c) { keyMap.set(c.getAttribute('data-key'), c); });
-                    var newKeySet = new Set();
-                    newKeys.forEach(function(c) { newKeySet.add(c.getAttribute('data-key')); });
-                    keyMap.forEach(function(node, key) {
-                        if (!newKeySet.has(key)) oldNode.removeChild(node);
-                    });
-                    for (var ci = newKeys.length - 1; ci >= 0; ci--) {
-                        var nkc = newKeys[ci];
-                        var nk = nkc.getAttribute('data-key');
-                        var okc = keyMap.get(nk);
-                        if (okc) {
-                            var oi = okc.firstChild;
-                            var ni = nkc.firstChild;
-                            if (oi && ni) { utils.patchDom(oi, ni); }
-                            else if (!oi && ni) { okc.appendChild(ni.cloneNode(true)); }
-                            else if (oi && !ni) { okc.removeChild(oi); }
-                            var curIdx = Array.from(oldNode.childNodes).indexOf(okc);
-                            var tgtIdx = newKeys.length - 1 - ci;
-                            if (curIdx !== tgtIdx) {
-                                var refNode = oldNode.childNodes[tgtIdx];
-                                if (refNode) { oldNode.insertBefore(okc, refNode); }
-                                else { oldNode.appendChild(okc); }
-                            }
-                        } else {
-                            var clone = nkc.cloneNode(true);
-                            var ref = oldNode.childNodes[ci + 1] || null;
-                            oldNode.insertBefore(clone, ref);
-                        }
-                    }
-                    var nonKeyOld = oldChildren.filter(function(c) { return !(c.nodeType === 1 && c.tagName === 'SHADOWIT-KEY'); });
-                    var nonKeyNew = newChildren.filter(function(c) { return !(c.nodeType === 1 && c.tagName === 'SHADOWIT-KEY'); });
-                    var maxLen = Math.max(nonKeyOld.length, nonKeyNew.length);
-                    for (var di = 0; di < maxLen; di++) {
-                        if (di < nonKeyOld.length && di < nonKeyNew.length) {
-                            utils.patchDom(nonKeyOld[di], nonKeyNew[di]);
-                        } else if (di < nonKeyOld.length) {
-                            oldNode.removeChild(nonKeyOld[di]);
-                        } else {
-                            oldNode.appendChild(nonKeyNew[di].cloneNode(true));
-                        }
-                    }
-                } else {
-                    var maxL = Math.max(oldChildren.length, newChildren.length);
-                    for (var ei = 0; ei < maxL; ei++) {
-                        if (ei < oldChildren.length && ei < newChildren.length) {
-                            utils.patchDom(oldChildren[ei], newChildren[ei]);
-                        } else if (ei < oldChildren.length) {
-                            oldNode.removeChild(oldChildren[ei]);
-                        } else {
-                            oldNode.appendChild(newChildren[ei].cloneNode(true));
-                        }
-                    }
-                }
-            }
-        },
-
-        patchInner(container, newHtml) {
-            var oldHtml = container.innerHTML;
-            if (oldHtml === newHtml) return;
-            var newFragment = utils.htmlToNodes(newHtml);
-            var oldRoot = container.firstChild;
-            var newRoot = newFragment.firstChild;
-            if (oldRoot && newRoot && oldRoot.nodeType === Node.ELEMENT_NODE && newRoot.nodeType === Node.ELEMENT_NODE) {
-                utils.patchDom(oldRoot, newRoot);
-            } else {
-                container.innerHTML = newHtml;
-            }
+            return { name: expr, args: [] };
         }
     };
 
     // ============================================================
-    // 事件管理器
+    // 事件委托管理器（在 _root 上统一监听，永不重建）
     // ============================================================
-    function EventManager(target, eventsOnHost) {
-        this.target = target;
-        this.handlers = [];
-        this.eventsOnHost = eventsOnHost || false;
+    function DelegatedEventManager(root, dataFn, methodsFn, bindCallback) {
+        this._root = root;
+        this._dataFn = dataFn;
+        this._methodsFn = methodsFn;
+        this._bindCallback = bindCallback || null;
+        this._listeners = {};   // { eventType: boundFn }
+        this._handlers = {};    // { eventType: [{ selector, handlerName, parsedArgs }] }
+        this._boundNodes = new WeakSet();  // 增量绑定：标记已扫描节点
+        this._bindings = [];    // @bind 绑定列表
     }
-    EventManager.prototype.on = function(event, selector, handler) {
-        if (!this.target) return this;
-        var self = this;
-        var wrappedHandler = function(e) {
-            var target = e.target;
-            var root = self.target.shadowRoot || self.target;
-            while (target && target !== root) {
-                if (target.matches && target.matches(selector)) {
-                    handler.call(target, e, target);
-                    break;
+
+    DelegatedEventManager.prototype.scan = function(newNodes) {
+        if (!this._root) return this;
+
+        // 保留已存在元素的处理器（它们已移除 @click 属性，但 __sdit_events 标记仍在）
+        var newHandlers = {};
+        for (var et in this._handlers) {
+            if (this._handlers.hasOwnProperty(et)) {
+                var existing = this._handlers[et];
+                for (var hi = 0; hi < existing.length; hi++) {
+                    var h = existing[hi];
+                    if (h.element && h.element.isConnected && h.element.__sdit_events && h.element.__sdit_events[et]) {
+                        if (!newHandlers[et]) newHandlers[et] = [];
+                        newHandlers[et].push(h);
+                    }
                 }
-                target = target.parentNode;
-            }
-        };
-        this.target.addEventListener(event, wrappedHandler);
-        this.handlers.push({ event: event, selector: selector, handler: wrappedHandler, original: handler });
-        return this;
-    };
-    EventManager.prototype.off = function(event, selector, handler) {
-        if (!this.target) return this;
-        var toRemove = [];
-        for (var i = 0; i < this.handlers.length; i++) {
-            var h = this.handlers[i];
-            if (h.event === event && h.selector === selector && h.original === handler) {
-                this.target.removeEventListener(event, h.handler);
-                toRemove.push(h);
             }
         }
-        for (var j = 0; j < toRemove.length; j++) {
-            var idx = this.handlers.indexOf(toRemove[j]);
-            if (idx > -1) this.handlers.splice(idx, 1);
+
+        // 保留仍然连接的 @bind 绑定
+        var newBindings = [];
+        var self = this;
+        for (var bi = 0; bi < this._bindings.length; bi++) {
+            if (this._bindings[bi].el && this._bindings[bi].el.isConnected) {
+                newBindings.push(this._bindings[bi]);
+            }
         }
+
+        // 增量扫描：如果有 newNodes，只扫描新节点；否则全量扫描
+        var nodesToScan;
+        if (newNodes && newNodes.length > 0) {
+            nodesToScan = newNodes;
+        } else {
+            // 全量扫描（首次渲染）
+            nodesToScan = this._root.querySelectorAll('*');
+        }
+
+        for (var i = 0; i < nodesToScan.length; i++) {
+            var el = nodesToScan[i];
+            // WeakSet 去重：已扫描过的节点跳过
+            if (this._boundNodes.has(el)) continue;
+            this._boundNodes.add(el);
+
+            var attrs = el.getAttributeNames ? el.getAttributeNames() : [];
+            for (var j = 0; j < attrs.length; j++) {
+                var name = attrs[j];
+                if (name.charAt(0) === '@' && name !== '@key') {
+                    var attrValue = el.getAttribute(name);
+                    el.removeAttribute(name);
+
+                    // @bind 双向绑定：特殊处理
+                    if (name === '@bind' && attrValue && this._bindCallback) {
+                        if (!el.__sdit_events) el.__sdit_events = {};
+                        el.__sdit_events['__bind__'] = true;
+                        var bindPath = attrValue;
+                        // 设置初始值
+                        var data = this._dataFn ? this._dataFn() : {};
+                        var initVal = utils.getNested(data, bindPath);
+                        if (initVal !== undefined && initVal !== null) {
+                            if (el.type === 'checkbox') {
+                                el.checked = !!initVal;
+                            } else {
+                                el.value = String(initVal);
+                            }
+                        }
+                        var bindHandler = (function(path, elem) {
+                            return function(e) {
+                                var val;
+                                if (elem.type === 'checkbox') val = elem.checked;
+                                else val = elem.value;
+                                self._bindCallback(path, val);
+                            };
+                        })(bindPath, el);
+                        el.addEventListener('input', bindHandler);
+                        el.addEventListener('change', bindHandler);
+                        newBindings.push({ el: el, path: bindPath, handler: bindHandler });
+                        continue;
+                    }
+
+                    // 普通事件委托 @click, @submit 等
+                    if (attrValue) {
+                        var eventType = name.slice(1);
+                        if (!newHandlers[eventType]) newHandlers[eventType] = [];
+                        if (!el.__sdit_events) el.__sdit_events = {};
+                        if (el.__sdit_events[eventType]) continue;
+                        el.__sdit_events[eventType] = true;
+                        var parsed = utils.parseEventExpr(attrValue);
+                        newHandlers[eventType].push({
+                            element: el,
+                            handlerName: parsed.name,
+                            parsedArgs: parsed.args
+                        });
+                    }
+                }
+            }
+        }
+        this._handlers = newHandlers;
+        this._bindings = newBindings;
+        this._ensureListeners();
         return this;
     };
-    EventManager.prototype.offAll = function() {
-        if (!this.target) return this;
-        for (var i = 0; i < this.handlers.length; i++) {
-            this.target.removeEventListener(this.handlers[i].event, this.handlers[i].handler);
+
+    DelegatedEventManager.prototype._ensureListeners = function() {
+        var self = this;
+        // 移除不再需要的监听器
+        for (var et in this._listeners) {
+            if (this._listeners.hasOwnProperty(et) && !this._handlers[et]) {
+                this._root.removeEventListener(et, this._listeners[et]);
+                delete this._listeners[et];
+            }
         }
-        this.handlers = [];
-        return this;
+        // 添加新的监听器
+        for (var eventType in this._handlers) {
+            if (this._handlers.hasOwnProperty(eventType) && !this._listeners[eventType]) {
+                var boundFn = (function(et) {
+                    return function(e) {
+                        var target = e.target;
+                        while (target && target !== self._root) {
+                            if (target.__sdit_events && target.__sdit_events[et]) {
+                                var handlers = self._handlers[et];
+                                for (var hi = 0; hi < handlers.length; hi++) {
+                                    if (handlers[hi].element === target) {
+                                        self._invokeHandler(handlers[hi], e, target);
+                                        break;
+                                    }
+                                }
+                            }
+                            target = target.parentNode;
+                        }
+                    };
+                })(eventType);
+                this._listeners[eventType] = boundFn;
+                this._root.addEventListener(eventType, boundFn);
+            }
+        }
     };
-    EventManager.prototype.destroy = function() {
-        this.offAll();
-        this.target = null;
+
+    DelegatedEventManager.prototype._invokeHandler = function(h, e, el) {
+        var data = this._dataFn ? this._dataFn() : {};
+        var methods = this._methodsFn ? this._methodsFn() : {};
+        var fn = utils.isFunction(data[h.handlerName]) ? data[h.handlerName] :
+            (utils.isFunction(methods[h.handlerName]) ? methods[h.handlerName] : null);
+        if (!fn) return;
+
+        var resolvedArgs = [];
+        for (var i = 0; i < h.parsedArgs.length; i++) {
+            var arg = h.parsedArgs[i];
+            if (arg && typeof arg === 'object' && arg.$path) {
+                var val = utils.getNested(data, arg.$path);
+                resolvedArgs.push(val !== undefined ? val : arg.$path);
+            } else {
+                resolvedArgs.push(arg);
+            }
+        }
+        fn.apply(el, [e, el].concat(resolvedArgs));
+    };
+
+    DelegatedEventManager.prototype.destroy = function() {
+        for (var et in this._listeners) {
+            if (this._listeners.hasOwnProperty(et)) {
+                this._root.removeEventListener(et, this._listeners[et]);
+            }
+        }
+        // 清理 @bind 绑定
+        for (var i = 0; i < this._bindings.length; i++) {
+            var b = this._bindings[i];
+            if (b.el && b.handler) {
+                b.el.removeEventListener('input', b.handler);
+                b.el.removeEventListener('change', b.handler);
+            }
+        }
+        this._listeners = {};
+        this._handlers = {};
+        this._bindings = [];
+        this._root = null;
     };
 
     // ============================================================
@@ -576,8 +647,6 @@
             console.warn('[shadowit] 当前浏览器不支持 Shadow DOM 或 Custom Elements，请加载 polyfill。');
         }
         options = options || {};
-
-        // 统一 styles → css
         var cssVal = options.css || options.styles || '';
 
         this.options = {
@@ -585,50 +654,50 @@
             css: cssVal,
             data: options.data || {},
             mode: options.mode || 'open',
-            slots: options.slots || {},
             lifecycle: options.lifecycle || {},
             onError: options.onError || null,
             eventsOnHost: options.eventsOnHost || false,
-            name: options.name || null
+            name: options.name || null,
+            methods: options.methods || {},
+            computed: options.computed || {},
+            reactive: options.reactive !== false  // 默认开启 Proxy 响应式
         };
 
         this._id = utils.uid();
         this._data = utils.deepClone(this.options.data);
-        this._slots = utils.deepClone(this.options.slots);
         this._rendered = false;
         this._destroyed = false;
         this._mounted = false;
         this._pendingSelector = null;
         this._queryCache = new Map();
         this._onceCache = {};
+        this._updating = false;
+        this._updateScheduled = false;   // requestAnimationFrame 批处理标记
+        this._pendingPromises = [];       // #await 待处理 Promise
 
         this._host = null;
         this._root = null;
-        this._container = null;
         this._lastHtml = '';
-
-        this._eventManager = null;
+        this._delegatedEvents = null;
 
         this._lifecycle = {
             beforeRender: this.options.lifecycle.beforeRender || null,
             afterRender: this.options.lifecycle.afterRender || null,
             beforeUpdate: this.options.lifecycle.beforeUpdate || null,
             afterUpdate: this.options.lifecycle.afterUpdate || null,
+            shouldUpdate: this.options.lifecycle.shouldUpdate || null,
             destroy: this.options.lifecycle.destroy || null
         };
 
         this._name = this.options.name;
         if (this._name && typeof this._name === 'string') {
-            var store = shadowit._instanceStore || shadowit.instance;
-            if (store[this._name]) {
+            if (shadowit._nameMap[this._name]) {
                 console.warn('[shadowit] 实例名称 "' + this._name + '" 已存在，将被覆盖。');
             }
-            store[this._name] = this;
+            shadowit._nameMap[this._name] = this;
         }
 
-        if (host) {
-            this.mount(host);
-        }
+        if (host) { this.mount(host); }
     }
 
     ShadowIt._rootSeed = 0;
@@ -643,21 +712,27 @@
 
         this._root = this._host.attachShadow({ mode: this.options.mode });
         this._mounted = true;
+        shadowit._instances.set(this._host, this);
 
-        var eventTarget = this.options.eventsOnHost ? this._host : this._root;
-        this._eventManager = new EventManager(eventTarget, this.options.eventsOnHost);
-
-        this._applyCSS();
-
-        if (!this.options.template) {
-            while (this._host.firstChild) {
-                this._root.appendChild(this._host.firstChild);
+        var self = this;
+        var eventRoot = this.options.eventsOnHost ? this._host : this._root;
+        this._delegatedEvents = new DelegatedEventManager(
+            eventRoot,
+            function() { return self._data; },
+            function() { return self.options.methods; },
+            // @bind 回调：自动回写数据并触发更新
+            function(path, value) {
+                utils._setNested(self._data, path, value);
+                self.update();
             }
-            this._rendered = true;
-            this._callHook('afterRender');
-            return this;
+        );
+
+        // 启用 Proxy 响应式（默认开启）
+        if (this.options.reactive && typeof Proxy !== 'undefined') {
+            this._makeReactive();
         }
 
+        this._applyCSS();
         this.render();
         return this;
     };
@@ -676,10 +751,7 @@
         return this;
     };
 
-    // 兼容旧 styles 方法
-    ShadowIt.prototype.styles = function(cssStr) {
-        return this.css(cssStr);
-    };
+    ShadowIt.prototype.styles = function(cssStr) { return this.css(cssStr); };
 
     ShadowIt.prototype.data = function(newData) {
         if (this._destroyed) return this;
@@ -689,66 +761,30 @@
 
     ShadowIt.prototype.setData = function(newData) {
         if (this._destroyed) return this;
-        if (utils.isObject(newData)) this._data = utils.deepClone(newData);
-        return this;
-    };
-
-    ShadowIt.prototype.getData = function() {
-        return utils.deepClone(this._data);
-    };
-
-    ShadowIt.prototype.slot = function(name, content) {
-        if (this._destroyed) return this;
-        this._slots[name] = content;
-        if (this._mounted && this._rendered) this.render();
-        return this;
-    };
-
-    // ----- 渲染与更新 -----
-    ShadowIt.prototype.render = function() {
-        if (this._destroyed) throw new Error('[shadowit] 实例已销毁');
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-
-        try {
-            this._callHook('beforeRender');
-            this._root.innerHTML = '';
-
-            var hostSlots = utils.extractSlots(this._host);
-            var allSlots = {};
-            for (var key in this._slots) { if (this._slots.hasOwnProperty(key)) allSlots[key] = this._slots[key]; }
-            for (var hk in hostSlots) {
-                if (hostSlots.hasOwnProperty(hk) && hostSlots[hk] && hostSlots[hk].length > 0) {
-                    allSlots[hk] = hostSlots[hk];
-                }
+        if (utils.isObject(newData)) {
+            this._data = utils.deepClone(newData);
+            // 重新包装 Proxy（如果响应式已启用）
+            if (this.options.reactive && typeof Proxy !== 'undefined') {
+                this._makeReactive();
             }
-            var renderData = {};
-            for (var dk in this._data) { if (this._data.hasOwnProperty(dk)) renderData[dk] = this._data[dk]; }
-            renderData._slots = allSlots;
-
-            var html = this.options.template || '';
-            if (utils.isFunction(html)) {
-                html = html(renderData);
-            }
-            if (utils.isString(html)) {
-                html = utils.renderTemplate(html, renderData, this._onceCache);
-            }
-
-            var fragment = utils.htmlToNodes(html);
-            this._root.appendChild(fragment);
-            this._container = this._root.firstChild;
-            this._rendered = true;
-            this._lastHtml = html;
-
-            this._processTemplateEvents();
-            this._queryCache.clear();
-            if (shadowit._cacheEnabled) {
-                shadowit.clearQueryCache();
-            }
-            this._callHook('afterRender');
-        } catch (err) {
-            this._handleError(err, 'render');
         }
         return this;
+    };
+
+    ShadowIt.prototype.getData = function() { return utils.deepClone(this._data); };
+
+    // ----- 渲染与更新 -----
+    ShadowIt.prototype._renderToHtml = function() {
+        var html = this.options.template || '';
+        if (utils.isFunction(html)) html = html(this._data);
+        if (utils.isString(html)) html = utils.renderTemplate(html, this._data, this._onceCache, this._pendingPromises);
+        return html;
+    };
+
+    ShadowIt.prototype.render = function() {
+        if (this._destroyed) throw new Error('[shadowit] 实例已销毁');
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        return this.update(null);
     };
 
     ShadowIt.prototype.update = function(newData) {
@@ -756,74 +792,477 @@
             console.warn('[shadowit] 实例已销毁，无法更新');
             return this;
         }
+        if (this._updating) {
+            if (utils.isObject(newData)) utils.merge(this._data, newData);
+            return this;
+        }
         if (!this._mounted) {
             if (utils.isObject(newData)) utils.merge(this._data, newData);
             return this;
         }
 
+        this._updating = true;
+        this._updateScheduled = false;
+        var isFirstRender = !this._rendered;
+        var oldData = isFirstRender ? null : utils.deepClone(this._data);
         try {
-            this._callHook('beforeUpdate', newData);
+            if (isFirstRender) {
+                this._callHook('beforeRender');
+            } else {
+                this._callHook('beforeUpdate', newData, oldData);
+            }
+
             if (utils.isObject(newData)) utils.merge(this._data, newData);
 
-            var hostSlots = utils.extractSlots(this._host);
-            var allSlots = {};
-            for (var key in this._slots) { if (this._slots.hasOwnProperty(key)) allSlots[key] = this._slots[key]; }
-            for (var hk in hostSlots) {
-                if (hostSlots.hasOwnProperty(hk) && hostSlots[hk] && hostSlots[hk].length > 0) {
-                    allSlots[hk] = hostSlots[hk];
+            // shouldUpdate 钩子：数据合并后调用，允许开发者根据最终状态判断是否跳过渲染
+            if (!isFirstRender && utils.isFunction(this._lifecycle.shouldUpdate)) {
+                if (!this._lifecycle.shouldUpdate.call(this, newData, this._data)) {
+                    this._updating = false;
+                    return this;
                 }
             }
-            var renderData = {};
-            for (var dk in this._data) { if (this._data.hasOwnProperty(dk)) renderData[dk] = this._data[dk]; }
-            renderData._slots = allSlots;
 
-            var html = this.options.template || '';
-            if (utils.isFunction(html)) {
-                html = html(renderData);
-            }
-            if (utils.isString(html)) {
-                html = utils.renderTemplate(html, renderData, this._onceCache);
-            }
+            // 计算 computed 属性
+            this._evalComputed();
 
-            if (this._container && this._lastHtml !== undefined) {
-                utils.patchInner(this._container, html);
-                this._lastHtml = html;
-            } else {
-                this.render();
+            // 收集 #await 待处理的 Promise
+            this._pendingPromises = [];
+            var html = this._renderToHtml();
+            if (html === this._lastHtml && !isFirstRender && this._pendingPromises.length === 0) {
+                this._updating = false;
                 return this;
             }
 
-            this._processTemplateEvents();
-            this._queryCache.clear();
-            if (shadowit._cacheEnabled) {
-                shadowit.clearQueryCache();
+            var newNodes = [];
+            if (isFirstRender) {
+                this._root.innerHTML = html;
+            } else {
+                newNodes = this._keyedDiff(this._root, html);
             }
-            this._callHook('afterUpdate', newData);
+            this._rendered = true;
+            this._lastHtml = html;
+
+            // 增量事件绑定：仅扫描新节点
+            this._delegatedEvents.scan(newNodes.length > 0 ? newNodes : null);
+            this._queryCache.clear();
+            if (shadowit._cacheEnabled) shadowit.clearQueryCache();
+
+            // 处理 #portal 传送门
+            this._handlePortals();
+
+            // 处理 #await Promise 回调
+            this._resolvePendingPromises();
+
+            if (isFirstRender) this._callHook('afterRender', this._data);
+            else this._callHook('afterUpdate', newData, this._data);
         } catch (err) {
-            this._handleError(err, 'update');
+            this._handleError(err, isFirstRender ? 'render' : 'update');
+        }
+        this._updating = false;
+        return this;
+    };
+
+    // ============================================================
+    // Keyed Diff — 两阶段键控 Diff + 位置移动检测
+    // 阶段一：处理 keyed 节点（移除/复用/移动）
+    // 阶段二：处理非 keyed 段落（标签感知 diff）
+    // ============================================================
+    ShadowIt.prototype._keyedDiff = function(parent, newHtml) {
+        var temp = document.createElement('div');
+        temp.innerHTML = newHtml;
+
+        var oldChildren = Array.from(parent.childNodes);
+        var newChildren = Array.from(temp.childNodes);
+        var oldLen = oldChildren.length, newLen = newChildren.length;
+        var newNodes = [];  // 收集新增节点，供增量事件绑定使用
+
+        // ---- 收集旧的 keyed 节点 ----
+        var oldKeyMap = new Map();   // key -> node
+        var oldKeyList = [];          // [{ key, node, index }]
+        for (var oi = 0; oi < oldLen; oi++) {
+            var oc = oldChildren[oi];
+            if (oc.nodeType === 1 && oc.tagName === 'SHADOWIT-KEY') {
+                var key = oc.getAttribute('data-key');
+                oldKeyMap.set(key, oc);
+                oldKeyList.push({ key: key, node: oc, index: oi });
+            }
+        }
+
+        // ---- 收集新的 keyed 节点 ----
+        var newKeySpecs = [];         // [{ key, node, index }]
+        var newKeyMap = new Map();    // key -> spec
+        for (var ni = 0; ni < newLen; ni++) {
+            var nc = newChildren[ni];
+            if (nc.nodeType === 1 && nc.tagName === 'SHADOWIT-KEY') {
+                var spec = { key: nc.getAttribute('data-key'), node: nc, index: ni };
+                newKeySpecs.push(spec);
+                newKeyMap.set(spec.key, spec);
+            }
+        }
+
+        // ---- 分治：有 keyed 节点的情况 ----
+        if (newKeySpecs.length > 0 || oldKeyList.length > 0) {
+            // 阶段一：移除旧的不再需要的 keyed 节点
+            for (var oki = 0; oki < oldKeyList.length; oki++) {
+                if (!newKeyMap.has(oldKeyList[oki].key)) {
+                    parent.removeChild(oldKeyList[oki].node);
+                }
+            }
+
+            // 阶段一续：按新顺序构建最终子节点列表
+            var newChildList = [];
+
+            for (var nni = 0; nni < newLen; nni++) {
+                var nchild = newChildren[nni];
+                if (nchild.nodeType === 1 && nchild.tagName === 'SHADOWIT-KEY') {
+                    var nkey = nchild.getAttribute('data-key');
+                    var oldNode = oldKeyMap.get(nkey);
+                    if (oldNode) {
+                        var oldInner = oldNode.innerHTML;
+                        var newInner = nchild.innerHTML;
+                        if (oldInner !== newInner) {
+                            oldNode.innerHTML = newInner;
+                            // 收集新插入的子节点（innerHTML 更新产生的）
+                            var innerChildren = oldNode.querySelectorAll('*');
+                            for (var ici = 0; ici < innerChildren.length; ici++) {
+                                newNodes.push(innerChildren[ici]);
+                            }
+                        }
+                        newChildList.push(oldNode);
+                    } else {
+                        // 新 key，创建
+                        var cloned = nchild.cloneNode(true);
+                        newChildList.push(cloned);
+                        // 收集新节点及其子树
+                        newNodes.push(cloned);
+                        var subNodes = cloned.querySelectorAll('*');
+                        for (var sni = 0; sni < subNodes.length; sni++) {
+                            newNodes.push(subNodes[sni]);
+                        }
+                    }
+                } else {
+                    // 非 keyed 节点：尝试从旧子节点中找对应位置复用
+                    var cloned2 = nchild.cloneNode(true);
+                    newChildList.push(cloned2);
+                    newNodes.push(cloned2);
+                    var subNodes2 = cloned2.querySelectorAll('*');
+                    for (var sn2 = 0; sn2 < subNodes2.length; sn2++) {
+                        newNodes.push(subNodes2[sn2]);
+                    }
+                }
+            }
+
+            // 清空并重建
+            while (parent.firstChild) { parent.removeChild(parent.firstChild); }
+            for (var li = 0; li < newChildList.length; li++) {
+                parent.appendChild(newChildList[li]);
+            }
+        } else {
+            // ---- 无 keyed 节点：标签感知 diff ----
+            this._diffChildren(parent, oldChildren, newChildren, newNodes);
+        }
+        return newNodes;
+    };
+
+    // ============================================================
+    // 递归子节点 Diff — 保留 DOM 节点状态（input 焦点、video 进度等）
+    // ============================================================
+    ShadowIt.prototype._diffChildren = function(parent, oldChildren, newChildren, newNodes) {
+        var oldLen = oldChildren.length, newLen = newChildren.length;
+        var oIdx = 0, nIdx = 0;
+        while (oIdx < oldLen && nIdx < newLen) {
+            var oc = oldChildren[oIdx], nc = newChildren[nIdx];
+            if (oc.nodeType === nc.nodeType && oc.nodeName === nc.nodeName) {
+                if (oc.nodeType === 3) {
+                    // 文本节点：直接更新内容
+                    if (oc.textContent !== nc.textContent) oc.textContent = nc.textContent;
+                } else if (oc.nodeType === 1) {
+                    // 元素节点：浅层属性 diff
+                    var oldAttrs = oc.attributes, newAttrs = nc.attributes;
+                    for (var ai = oldAttrs.length - 1; ai >= 0; ai--) {
+                        if (!nc.hasAttribute(oldAttrs[ai].name)) {
+                            oc.removeAttribute(oldAttrs[ai].name);
+                        }
+                    }
+                    for (var bi = 0; bi < newAttrs.length; bi++) {
+                        if (oc.getAttribute(newAttrs[bi].name) !== newAttrs[bi].value) {
+                            oc.setAttribute(newAttrs[bi].name, newAttrs[bi].value);
+                        }
+                    }
+                    // 递归 diff 子节点，而不是 innerHTML 替换
+                    var oldChildNodes = Array.from(oc.childNodes);
+                    var newChildNodes = Array.from(nc.childNodes);
+                    this._diffChildren(oc, oldChildNodes, newChildNodes, newNodes);
+                }
+                oIdx++; nIdx++;
+            } else {
+                // 向前搜索匹配标签（搜索全局而非仅 6 个）
+                var matchIdx = -1;
+                for (var si = oIdx + 1; si < oldLen; si++) {
+                    if (oldChildren[si].nodeType === nc.nodeType && oldChildren[si].nodeName === nc.nodeName) {
+                        matchIdx = si; break;
+                    }
+                }
+                if (matchIdx > -1) {
+                    // 移除中间不匹配的节点
+                    for (var ri = oIdx; ri < matchIdx; ri++) {
+                        parent.removeChild(oldChildren[ri]);
+                    }
+                    parent.insertBefore(oldChildren[matchIdx], oc || null);
+                    // 递归 diff 匹配到的节点
+                    if (oldChildren[matchIdx].nodeType === 1) {
+                        var oldSub = Array.from(oldChildren[matchIdx].childNodes);
+                        var newSub = Array.from(nc.childNodes);
+                        this._diffChildren(oldChildren[matchIdx], oldSub, newSub, newNodes);
+                    } else if (oldChildren[matchIdx].nodeType === 3 &&
+                               oldChildren[matchIdx].textContent !== nc.textContent) {
+                        oldChildren[matchIdx].textContent = nc.textContent;
+                    }
+                    oIdx = matchIdx + 1; nIdx++;
+                } else {
+                    // 找不到匹配，插入新节点
+                    var cloned = nc.cloneNode(true);
+                    parent.insertBefore(cloned, oc);
+                    parent.removeChild(oc);
+                    newNodes.push(cloned);
+                    var subNodes = cloned.querySelectorAll('*');
+                    for (var sn = 0; sn < subNodes.length; sn++) {
+                        newNodes.push(subNodes[sn]);
+                    }
+                    oIdx++; nIdx++;
+                }
+            }
+        }
+        // 移除多余的旧节点
+        while (oIdx < oldLen) { parent.removeChild(oldChildren[oIdx]); oIdx++; }
+        // 追加新节点
+        while (nIdx < newLen) {
+            var cloned4 = newChildren[nIdx].cloneNode(true);
+            parent.appendChild(cloned4);
+            newNodes.push(cloned4);
+            var subN4 = cloned4.querySelectorAll('*');
+            for (var sn4 = 0; sn4 < subN4.length; sn4++) newNodes.push(subN4[sn4]);
+            nIdx++;
+        }
+    };
+
+    // ----- 生命周期 -----
+    ShadowIt.prototype._callHook = function(name) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        var hook = this._lifecycle[name];
+        if (utils.isFunction(hook)) {
+            try { hook.apply(this, args); }
+            catch (err) { this._handleError(err, 'lifecycle.' + name); }
+        }
+    };
+
+    // ----- computed 计算属性 -----
+    ShadowIt.prototype._evalComputed = function() {
+        var computed = this.options.computed;
+        if (!utils.isObject(computed)) return;
+        for (var key in computed) {
+            if (computed.hasOwnProperty(key)) {
+                try {
+                    this._data[key] = computed[key].call(this, this._data);
+                } catch (err) {
+                    this._handleError(err, 'computed.' + key);
+                }
+            }
+        }
+    };
+
+    // ----- #portal 传送门处理 -----
+    ShadowIt.prototype._handlePortals = function() {
+        if (!this._root) return;
+        var portals = this._root.querySelectorAll('shadowit-portal');
+        if (portals.length === 0) return;
+        // 初始化 portal 节点追踪数组
+        if (!this._portalNodes) this._portalNodes = [];
+        for (var i = 0; i < portals.length; i++) {
+            var portal = portals[i];
+            var selector = portal.getAttribute('data-selector');
+            if (!selector) continue;
+            try {
+                var target = document.querySelector(selector);
+                if (target) {
+                    // 将 portal 内容移动到目标节点，并追踪
+                    while (portal.firstChild) {
+                        var child = portal.firstChild;
+                        target.appendChild(child);
+                        this._portalNodes.push(child);
+                    }
+                    // 移除空的 portal 占位符
+                    if (portal.parentNode) portal.parentNode.removeChild(portal);
+                }
+            } catch (err) {
+                this._handleError(err, 'portal: ' + selector);
+            }
+        }
+    };
+
+    // ----- #await Promise 处理 -----
+    ShadowIt.prototype._resolvePendingPromises = function() {
+        if (!this._pendingPromises || this._pendingPromises.length === 0) return;
+        var self = this;
+        for (var i = 0; i < this._pendingPromises.length; i++) {
+            var item = this._pendingPromises[i];
+            (function(p) {
+                p.promise.then(function(resolved) {
+                    // 将结果写入 data，触发重新渲染
+                    var updateData = {};
+                    if (p.thenVar) {
+                        updateData[p.thenVar] = resolved;
+                    }
+                    self.update(updateData);
+                }).catch(function(err) {
+                    self._handleError(err, '#await Promise rejected');
+                });
+            })(item);
+        }
+        this._pendingPromises = [];
+    };
+
+    // ----- Proxy 深响应式自动更新 -----
+    ShadowIt.prototype._makeReactive = function() {
+        // 递归代理已有数据
+        this._data = this._deepProxy(this._data);
+    };
+
+    ShadowIt.prototype._deepProxy = function(obj) {
+        if (!obj || typeof obj !== 'object') return obj;
+        // 已经代理过的跳过
+        if (obj.__sdit_proxy) return obj;
+        var self = this;
+        var handler = {
+            set: function(target, prop, value) {
+                var oldVal = target[prop];
+                if (value !== null && (typeof value === 'object')) {
+                    value = self._deepProxy(value);
+                }
+                target[prop] = value;
+                if (oldVal !== value && self._mounted && !self._destroyed) {
+                    self._scheduleUpdate();
+                }
+                return true;
+            },
+            deleteProperty: function(target, prop) {
+                if (prop in target) {
+                    delete target[prop];
+                    if (self._mounted && !self._destroyed) {
+                        self._scheduleUpdate();
+                    }
+                }
+                return true;
+            }
+        };
+        // 递归代理所有子对象
+        for (var key in obj) {
+            if (obj.hasOwnProperty(key) && obj[key] !== null && typeof obj[key] === 'object') {
+                obj[key] = self._deepProxy(obj[key]);
+            }
+        }
+        var proxy = new Proxy(obj, handler);
+        // 标记已代理（避免循环引用和重复代理）
+        Object.defineProperty(proxy, '__sdit_proxy', { value: true, enumerable: false, configurable: true });
+        return proxy;
+    };
+
+    ShadowIt.prototype._scheduleUpdate = function() {
+        if (this._updateScheduled || this._updating) return;
+        this._updateScheduled = true;
+        var self = this;
+        requestAnimationFrame(function() {
+            if (self._updateScheduled) {
+                self.update();
+            }
+        });
+    };
+
+    ShadowIt.prototype._handleError = function(err, context) {
+        try {
+            var msg = err && err.message ? err.message : String(err);
+            var stack = err && err.stack ? err.stack : '(no stack)';
+            console.error('[shadowit] 错误发生在 ' + context + ': ' + msg + '\n' + stack);
+            if (utils.isFunction(this.options.onError)) {
+                this.options.onError(err, context);
+            }
+        } catch (e) {
+            // 保底：onError 本身崩溃也不影响实例状态
+            console.error('[shadowit] onError 自身执行失败:', e && e.message ? e.message : e);
+        }
+    };
+
+    ShadowIt.prototype._applyCSS = function() {
+        if (!this._root) return this;
+        var oldStyles = this._root.querySelectorAll('style[data-shadowit]');
+        for (var i = 0; i < oldStyles.length; i++) oldStyles[i].remove();
+        var cssVal = this.options.css;
+        // 支持 css 为函数: css: (data) => '...'，实现动态样式
+        if (utils.isFunction(cssVal)) cssVal = cssVal(this._data);
+        if (cssVal) {
+            var styleEl = document.createElement('style');
+            styleEl.setAttribute('data-shadowit', this._id);
+            styleEl.textContent = cssVal;
+            this._root.prepend(styleEl);
         }
         return this;
     };
 
-    ShadowIt.prototype.refresh = function() {
-        if (this._destroyed) return this;
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        this.render();
+    ShadowIt.prototype._startObserver = function() {
+        if (!this._pendingSelector) return this;
+        var self = this;
+        var selector = this._pendingSelector;
+        var existing = document.querySelector(selector);
+        if (existing) { this._pendingSelector = null; this.mount(existing); return this; }
+        var observer = new MutationObserver(function() {
+            var el = document.querySelector(selector);
+            if (el) {
+                observer.disconnect();
+                self._pendingSelector = null;
+                try { self.mount(el); }
+                catch (err) { self._handleError(err, 'auto-mount'); }
+            }
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
         return this;
     };
 
     // ----- 事件绑定 -----
     ShadowIt.prototype.on = function(event, selector, handler) {
         if (this._destroyed) return this;
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        this._eventManager.on(event, selector, handler);
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        var target = this._delegatedEvents._root;
+        if (!target) throw new Error('[shadowit] 事件目标不可用');
+        var wrappedHandler = function(e) {
+            var t = e.target;
+            while (t && t !== target) {
+                if (t.matches && t.matches(selector)) { handler.call(t, e, t); break; }
+                t = t.parentNode;
+            }
+        };
+        target.addEventListener(event, wrappedHandler);
+        this._delegatedEvents._fallbackHandlers = this._delegatedEvents._fallbackHandlers || [];
+        this._delegatedEvents._fallbackHandlers.push({
+            event: event, selector: selector,
+            handler: handler, wrappedHandler: wrappedHandler
+        });
         return this;
     };
 
     ShadowIt.prototype.off = function(event, selector, handler) {
         if (this._destroyed) return this;
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        this._eventManager.off(event, selector, handler);
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        var target = this._delegatedEvents._root;
+        var fallback = this._delegatedEvents._fallbackHandlers || [];
+        for (var i = fallback.length - 1; i >= 0; i--) {
+            var entry = fallback[i];
+            if (entry.event !== event) continue;
+            // 精确匹配：selector 和 handler 均可选，层层过滤
+            if (selector && entry.selector !== selector) continue;
+            if (handler && entry.handler !== handler) continue;
+            target.removeEventListener(event, entry.wrappedHandler);
+            fallback.splice(i, 1);
+        }
         return this;
     };
 
@@ -835,127 +1274,37 @@
     ShadowIt.prototype.isMounted = function() { return this._mounted; };
 
     ShadowIt.prototype.querySelector = function(selector, root) {
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        root = utils.resolveRoot(root) || this._root;
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        if (root != null) root = utils.resolveRoot(root);
+        else root = this._root;
         return root.querySelector(selector);
     };
 
     ShadowIt.prototype.querySelectorAll = function(selector, root) {
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        root = utils.resolveRoot(root) || this._root;
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        if (root != null) root = utils.resolveRoot(root);
+        else root = this._root;
         return Array.from(root.querySelectorAll(selector));
     };
 
     ShadowIt.prototype.getName = function() { return this._name; };
     ShadowIt.prototype.getId = function() { return this._id; };
 
-    // ----- 内部方法 -----
-    ShadowIt.prototype._callHook = function(name) {
-        var args = Array.prototype.slice.call(arguments, 1);
-        var hook = this._lifecycle[name];
-        if (utils.isFunction(hook)) {
-            try { hook.apply(this, args); } catch (err) {
-                this._handleError(err, 'lifecycle.' + name);
-            }
-        }
-    };
-
-    ShadowIt.prototype._handleError = function(err, context) {
-        console.error('[shadowit] 错误发生在 ' + context + ':', err);
-        if (utils.isFunction(this.options.onError)) {
-            this.options.onError(err, context);
-        }
-    };
-
-    ShadowIt.prototype._applyCSS = function() {
-        if (!this._root) return this;
-        var oldStyles = this._root.querySelectorAll('style[data-shadowit]');
-        for (var i = 0; i < oldStyles.length; i++) oldStyles[i].remove();
-        if (this.options.css) {
-            var styleEl = utils.createStyleElement(this.options.css, this._id);
-            this._root.prepend(styleEl);
-        }
-        return this;
-    };
-
-    ShadowIt.prototype._processTemplateEvents = function() {
-        if (!this._root) return this;
-        var all = this._root.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            var attrs = el.getAttributeNames ? el.getAttributeNames() : [];
-            for (var j = attrs.length - 1; j >= 0; j--) {
-                var name = attrs[j];
-                if (name.charAt(0) === '@' && name !== '@key') {
-                    var event = name.slice(1);
-                    var handlerName = el.getAttribute(name);
-                    el.removeAttribute(name);
-                    if (handlerName) {
-                        var fn = utils.isFunction(this._data[handlerName]) ? this._data[handlerName] :
-                            (utils.isFunction(this.options.methods && this.options.methods[handlerName]) ? this.options.methods[handlerName] : null);
-                        if (fn) {
-                            el.addEventListener(event, function(e) {
-                                fn.call(el, e, el);
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        return this;
-    };
-
-    ShadowIt.prototype._startObserver = function() {
-        if (!this._pendingSelector) return this;
-        var self = this;
-        var selector = this._pendingSelector;
-        var existing = document.querySelector(selector);
-        if (existing) {
-            this._pendingSelector = null;
-            this.mount(existing);
-            return this;
-        }
-        var observer = new MutationObserver(function() {
-            var el = document.querySelector(selector);
-            if (el) {
-                observer.disconnect();
-                self._pendingSelector = null;
-                try {
-                    self.mount(el);
-                } catch (err) {
-                    self._handleError(err, 'auto-mount');
-                }
-            }
-        });
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-        return this;
-    };
-
     // ----- 快捷方法 -----
-    ShadowIt.prototype.getHTML = function() {
-        return this._root ? this._root.innerHTML : '';
-    };
+    ShadowIt.prototype.getHTML = function() { return this._root ? this._root.innerHTML : ''; };
 
     ShadowIt.prototype.getShadowDOM = function() {
         if (!this._mounted || !this._root) return [];
         var results = [];
         var walk = function(node) {
-            if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) {
-                results.push(node);
-            }
-            if (node.children) {
-                for (var i = 0; i < node.children.length; i++) {
-                    walk(node.children[i]);
-                }
-            }
+            if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) results.push(node);
+            if (node.children) for (var i = 0; i < node.children.length; i++) walk(node.children[i]);
         };
-        for (var i = 0; i < this._root.children.length; i++) {
-            walk(this._root.children[i]);
-        }
+        for (var i = 0; i < this._root.children.length; i++) walk(this._root.children[i]);
         return results;
     };
 
-    // ----- qS / qSAll (带缓存) -----
+    // ----- qS / qSAll (带缓存 + isConnected 自动失效) -----
     ShadowIt.prototype._rootKey = function(root) {
         if (root === this._root) return '__root__';
         if (!root.__sdit_ck) root.__sdit_ck = 'r' + (++ShadowIt._rootSeed);
@@ -963,12 +1312,15 @@
     };
 
     ShadowIt.prototype.qS = function(selector, root) {
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        root = utils.resolveRoot(root) || this._root;
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        if (root != null) root = utils.resolveRoot(root);
+        else root = this._root;
         if (!root) return null;
         var cacheKey = selector + '|qS|' + this._rootKey(root);
         if (this._queryCache.has(cacheKey)) {
-            return this._wrapResult(this._queryCache.get(cacheKey));
+            var cached = this._queryCache.get(cacheKey);
+            if (cached && cached.isConnected) return this._wrapResult(cached);
+            this._queryCache.delete(cacheKey);
         }
         var result = root.querySelector(selector);
         this._queryCache.set(cacheKey, result);
@@ -976,20 +1328,22 @@
     };
 
     ShadowIt.prototype.qSAll = function(selector, root) {
-        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载，请先调用 mount(host)');
-        root = utils.resolveRoot(root) || this._root;
+        if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
+        if (root != null) root = utils.resolveRoot(root);
+        else root = this._root;
         if (!root) return [];
         var cacheKey = selector + '|qSA|' + this._rootKey(root);
         if (this._queryCache.has(cacheKey)) {
             var cached = this._queryCache.get(cacheKey);
-            return cached.map(this._wrapResult.bind(this));
+            var valid = cached.filter(function(el) { return el && el.isConnected; });
+            if (valid.length === cached.length) return valid.map(this._wrapResult.bind(this));
+            this._queryCache.delete(cacheKey);
         }
         var result = Array.from(root.querySelectorAll(selector));
         this._queryCache.set(cacheKey, result);
         return result.map(this._wrapResult.bind(this));
     };
 
-    // 给查询结果挂载 .remove / .template / .css 方法
     ShadowIt.prototype._wrapResult = function(el) {
         if (!el) return el;
         if (el.__sdit_wrapped) return el;
@@ -998,16 +1352,8 @@
             if (el.parentNode) el.parentNode.removeChild(el);
         };
         el.remove = function() {
-            var store = shadowit._instanceStore || shadowit.instance;
-            for (var key in store) {
-                if (store.hasOwnProperty(key)) {
-                    var inst = store[key];
-                    if (inst._host === el) {
-                        inst.destroy();
-                        break;
-                    }
-                }
-            }
+            var inst = shadowit._instances.get(el);
+            if (inst) inst.destroy();
             return origRemove();
         };
         el.template = function(tpl) {
@@ -1024,102 +1370,60 @@
         return el;
     };
 
-    // ----- copy / paste -----
-    ShadowIt.prototype.copy = function(source, target) {
-        var srcEl = utils.resolveHost(source);
-        if (!srcEl) return null;
-        var wrapper = document.createElement('div');
-        wrapper.setAttribute('data-sdit-copy', '');
-        var clone = srcEl.cloneNode(true);
-        wrapper.appendChild(clone);
-        var shadow = wrapper.attachShadow({ mode: 'open' });
-        while (wrapper.firstChild) {
-            shadow.appendChild(wrapper.firstChild);
-        }
-        var self = this;
-        var clipboard = {
-            el: wrapper,
-            paste: function(dest) {
-                if (!dest) return clipboard;
-                var destEl = utils.resolveHost(dest);
-                if (destEl) {
-                    destEl.appendChild(wrapper);
-                }
-                return clipboard;
-            }
-        };
-        if (target) {
-            clipboard.paste(target);
-        }
-        return clipboard;
-    };
-
     // ----- destroy -----
     ShadowIt.prototype.destroy = function() {
         if (this._destroyed) return this;
-        try {
-            this._callHook('destroy');
-        } catch (err) {
-            this._handleError(err, 'destroy');
-        }
-        if (this._eventManager) {
-            this._eventManager.destroy();
-            this._eventManager = null;
-        }
-        if (this._root) {
-            this._root.innerHTML = '';
-            this._root = null;
+        try { this._callHook('destroy'); }
+        catch (err) { this._handleError(err, 'destroy'); }
+        if (this._delegatedEvents) { this._delegatedEvents.destroy(); this._delegatedEvents = null; }
+        if (this._root) { this._root.innerHTML = ''; this._root = null; }
+        if (this._host) { shadowit._instances.delete(this._host); }
+        if (this._name && shadowit._nameMap[this._name] === this) { delete shadowit._nameMap[this._name]; }
+        // 清理 #portal 移出的 DOM 节点
+        if (this._portalNodes && this._portalNodes.length > 0) {
+            for (var pi = 0; pi < this._portalNodes.length; pi++) {
+                var pn = this._portalNodes[pi];
+                if (pn && pn.parentNode) pn.parentNode.removeChild(pn);
+            }
+            this._portalNodes = null;
         }
         this._host = null;
-        this._container = null;
         this._destroyed = true;
         this._mounted = false;
         this._rendered = false;
-
-        var store = shadowit._instanceStore || shadowit.instance;
-        if (this._name && store[this._name] === this) {
-            delete store[this._name];
-        }
         return this;
     };
 
     // ============================================================
     // 全局查询
     // ============================================================
-    var _queryCache = new Map();
-    var _cacheEnabled = false;
+    var _queryCache = new Map(), _cacheEnabled = false;
 
     function globalQuery(selector, root, all) {
         var cacheKey = selector + '|' + (root === document ? 'document' : (root.id || root.tagName));
         if (_cacheEnabled && _queryCache.has(cacheKey)) {
             var cached = _queryCache.get(cacheKey);
-            return all ? cached : (cached.length > 0 ? cached[0] : null);
+            if (all) {
+                var valid = cached.filter(function(el) { return el && el.isConnected; });
+                if (valid.length === cached.length) return valid;
+            } else {
+                if (cached.length > 0 && cached[0] && cached[0].isConnected) return cached[0];
+            }
+            _queryCache.delete(cacheKey);
         }
-
         var results = [];
         var stack = [root];
         while (stack.length) {
             var node = stack.pop();
             if (node.nodeType === Node.ELEMENT_NODE) {
                 if (node.matches && node.matches(selector)) {
-                    if (!all) {
-                        if (_cacheEnabled) _queryCache.set(cacheKey, [node]);
-                        return node;
-                    }
+                    if (!all) { if (_cacheEnabled) _queryCache.set(cacheKey, [node]); return node; }
                     results.push(node);
                 }
-                if (node.shadowRoot && node.shadowRoot.mode === 'open') {
-                    stack.push(node.shadowRoot);
-                }
-                if (node.children) {
-                    for (var i = node.children.length - 1; i >= 0; i--) {
-                        stack.push(node.children[i]);
-                    }
-                }
+                if (node.shadowRoot && node.shadowRoot.mode === 'open') stack.push(node.shadowRoot);
+                if (node.children) for (var i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
             } else if (node.children) {
-                for (var j = node.children.length - 1; j >= 0; j--) {
-                    stack.push(node.children[j]);
-                }
+                for (var j = node.children.length - 1; j >= 0; j--) stack.push(node.children[j]);
             }
         }
         if (_cacheEnabled) _queryCache.set(cacheKey, results);
@@ -1127,207 +1431,156 @@
     }
 
     // ============================================================
-    // 批处理更新
+    // 批处理更新（带去重）
     // ============================================================
-    var _batchUpdates = [];
-    var _batchScheduled = false;
+    var _batchMap = new Map(), _batchScheduled = false;
 
     function flushBatch() {
-        var updates = _batchUpdates.slice();
-        _batchUpdates = [];
+        var updates = [];
+        _batchMap.forEach(function(item) { updates.push(item); });
+        _batchMap.clear();
         _batchScheduled = false;
-        updates.forEach(function(item) {
-            item.instance.update(item.data);
-        });
+        for (var i = 0; i < updates.length; i++) {
+            updates[i].instance.update(updates[i].data);
+        }
     }
 
     // ============================================================
     // 全局 shadowit 函数
     // ============================================================
     function shadowit(host, options) {
-        // 新签名: sdit(tpl, css/element/selector, element/selector)
         if (utils.isString(host) && arguments.length >= 2) {
-            var arg1 = arguments[0]; // template
-            var arg2 = arguments[1]; // css | element | selector
-            var arg3 = arguments[2]; // element | selector (only if arg2 is css)
-
+            var arg1 = arguments[0], arg2 = arguments[1], arg3 = arguments[2];
             if (utils.isCSS(arg2)) {
-                // sdit(tpl, css) 或 sdit(tpl, css, element/selector)
                 var opts = { template: arg1, css: arg2 };
                 if (arg3) {
                     var h = utils.resolveHost(arg3);
                     if (h) return new ShadowIt(h, opts);
-                    // 如果找不到，尝试 observer
                     if (utils.isString(arg3)) {
                         var inst = new ShadowIt(null, opts);
-                        inst._pendingSelector = arg3;
-                        inst._startObserver();
-                        return inst;
+                        inst._pendingSelector = arg3; inst._startObserver(); return inst;
                     }
                 }
                 return new ShadowIt(null, opts);
             }
-
-            if (arg2 instanceof Element) {
-                // sdit(tpl, element)
-                return new ShadowIt(arg2, { template: arg1 });
-            }
-
+            if (arg2 instanceof Element) return new ShadowIt(arg2, { template: arg1 });
             if (utils.isString(arg2)) {
-                // sdit(tpl, selector)
                 var h2 = utils.resolveHost(arg2);
                 if (h2) return new ShadowIt(h2, { template: arg1 });
                 var inst2 = new ShadowIt(null, { template: arg1 });
-                inst2._pendingSelector = arg2;
-                inst2._startObserver();
-                return inst2;
+                inst2._pendingSelector = arg2; inst2._startObserver(); return inst2;
             }
         }
-
-        // 判断是否传入配置对象作为第一参数
         if (host && typeof host === 'object' && !(host instanceof Element) && !utils.isString(host)) {
             return new ShadowIt(null, host);
         }
-
-        // 传统方式
-        if (utils.isString(options) || utils.isFunction(options)) {
-            options = { template: options };
-        }
+        if (utils.isString(options) || utils.isFunction(options)) options = { template: options };
         if (!options) options = {};
-
         if (utils.isString(host) && !document.querySelector(host)) {
             var inst = new ShadowIt(null, options);
-            inst._pendingSelector = host;
-            inst._startObserver();
-            return inst;
+            inst._pendingSelector = host; inst._startObserver(); return inst;
         }
-
         return new ShadowIt(host, options);
     }
 
-    shadowit.version = '0.12.0';
+    shadowit.version = '1.4.1';
     shadowit.utils = utils;
     shadowit.ShadowIt = ShadowIt;
     shadowit.isSupported = isSupported;
 
-    // 命名实例
-    shadowit.instance = {};
-    shadowit._instanceStore = null;
-    shadowit.setInstanceStore = function(store) {
-        if (store && typeof store === 'object') {
-            shadowit._instanceStore = store;
-        } else {
-            shadowit._instanceStore = shadowit.instance;
-        }
-        return shadowit;
-    };
-    shadowit.getInstance = function(name) {
-        var store = shadowit._instanceStore || shadowit.instance;
-        return store[name] || null;
-    };
+    // ============================================================
+    // 实例管理
+    // ============================================================
+    shadowit._instances = new WeakMap();
+    shadowit._nameMap = {};
+
+    shadowit.getInstance = function(name) { return shadowit._nameMap[name] || null; };
     shadowit.unregisterInstance = function(name) {
-        var store = shadowit._instanceStore || shadowit.instance;
-        if (store[name]) {
-            delete store[name];
-        }
+        if (shadowit._nameMap[name]) delete shadowit._nameMap[name];
         return shadowit;
     };
+    shadowit.getInstanceByHost = function(host) { return shadowit._instances.get(host) || null; };
+
+    shadowit.instance = new Proxy({}, {
+        get: function(_, prop) {
+            return typeof prop === 'string' && prop !== 'length' && prop !== 'constructor' ?
+                shadowit._nameMap[prop] : undefined;
+        },
+        set: function(_, prop, value) {
+            if (typeof prop === 'string') shadowit._nameMap[prop] = value;
+            return true;
+        },
+        deleteProperty: function(_, prop) {
+            if (typeof prop === 'string') delete shadowit._nameMap[prop];
+            return true;
+        },
+        has: function(_, prop) { return typeof prop === 'string' && shadowit._nameMap.hasOwnProperty(prop); },
+        ownKeys: function() { return Object.keys(shadowit._nameMap); },
+        getOwnPropertyDescriptor: function(_, prop) {
+            if (shadowit._nameMap.hasOwnProperty(prop)) {
+                return { enumerable: true, configurable: true, value: shadowit._nameMap[prop] };
+            }
+            return undefined;
+        }
+    });
 
     // 全局查询
-    shadowit.querySelector = function(selector, root) {
-        root = utils.resolveRoot(root);
-        return globalQuery(selector, root, false);
-    };
-    shadowit.querySelectorAll = function(selector, root) {
-        root = utils.resolveRoot(root);
-        return globalQuery(selector, root, true) || [];
-    };
+    shadowit.querySelector = function(selector, root) { return globalQuery(selector, utils.resolveRoot(root), false); };
+    shadowit.querySelectorAll = function(selector, root) { return globalQuery(selector, utils.resolveRoot(root), true) || []; };
     shadowit.enableQueryCache = function(enable) {
         _cacheEnabled = enable !== false;
         if (!_cacheEnabled) _queryCache.clear();
         return shadowit;
     };
-    shadowit.clearQueryCache = function() {
-        _queryCache.clear();
-        return shadowit;
-    };
+    shadowit.clearQueryCache = function() { _queryCache.clear(); return shadowit; };
     shadowit._cacheEnabled = false;
 
-    // 批处理更新
     shadowit.batchUpdate = function(instance, data) {
-        _batchUpdates.push({ instance: instance, data: data });
-        if (!_batchScheduled) {
-            _batchScheduled = true;
-            requestAnimationFrame(flushBatch);
-        }
+        _batchMap.set(instance._id || instance, { instance: instance, data: data });
+        if (!_batchScheduled) { _batchScheduled = true; requestAnimationFrame(flushBatch); }
         return shadowit;
     };
 
-    // ============================================================
     // remove / removeAll
-    // ============================================================
     shadowit.remove = function(name, root) {
         root = utils.resolveRoot(root);
-        var store = shadowit._instanceStore || shadowit.instance;
-        var inst = store[name];
-        if (inst && inst._host && root.contains(inst._host)) {
-            inst.destroy();
-        }
+        var inst = shadowit._nameMap[name];
+        if (inst && inst._host && root.contains(inst._host)) inst.destroy();
         return shadowit;
     };
-
     shadowit.removeAll = function(root) {
         root = utils.resolveRoot(root);
-        var store = shadowit._instanceStore || shadowit.instance;
-        var keys = [];
-        for (var key in store) {
-            if (store.hasOwnProperty(key)) keys.push(key);
-        }
-        for (var i = 0; i < keys.length; i++) {
-            var inst = store[keys[i]];
-            if (inst && inst.destroy && inst._host && root.contains(inst._host)) {
-                inst.destroy();
-            }
+        var names = Object.keys(shadowit._nameMap);
+        for (var i = 0; i < names.length; i++) {
+            var inst = shadowit._nameMap[names[i]];
+            if (inst && inst.destroy && inst._host && root.contains(inst._host)) inst.destroy();
         }
         return shadowit;
     };
 
-    // ============================================================
-    // scan - 扫描所有未挂载的 Shadow DOM 到 sdit.instance
-    // ============================================================
+    // scan
     shadowit.scan = function(root) {
         root = utils.resolveRoot(root);
-        var store = shadowit._instanceStore || shadowit.instance;
         var walk = function(node) {
             if (node.shadowRoot && node.shadowRoot.mode === 'open') {
-                var name = node.getAttribute('data-sdit-name') || node.id || (node.tagName ? node.tagName.toLowerCase() : '') + '-' + Date.now().toString(36);
-                if (!store[name]) {
+                if (!shadowit._instances.has(node)) {
+                    var name = node.getAttribute('data-sdit-name') || node.id ||
+                        (node.tagName ? node.tagName.toLowerCase() : '') + '-' + Date.now().toString(36);
                     var inst = new ShadowIt(null, { name: name });
-                    inst._host = node;
-                    inst._root = node.shadowRoot;
-                    inst._mounted = true;
-                    inst._rendered = true;
-                    store[name] = inst;
+                    inst._host = node; inst._root = node.shadowRoot;
+                    inst._mounted = true; inst._rendered = true;
+                    shadowit._instances.set(node, inst);
+                    shadowit._nameMap[name] = inst;
                 }
             }
-            if (node.children) {
-                for (var i = 0; i < node.children.length; i++) {
-                    walk(node.children[i]);
-                }
-            }
-            if (node.shadowRoot) {
-                for (var j = 0; j < node.shadowRoot.children.length; j++) {
-                    walk(node.shadowRoot.children[j]);
-                }
-            }
+            if (node.children) for (var i = 0; i < node.children.length; i++) walk(node.children[i]);
+            if (node.shadowRoot) for (var j = 0; j < node.shadowRoot.children.length; j++) walk(node.shadowRoot.children[j]);
         };
         walk(root);
         return shadowit;
     };
 
-    // ============================================================
-    // copy - 全局复制方法
-    // ============================================================
+    // copy
     shadowit.copy = function(source, target) {
         var srcEl = utils.resolveHost(source);
         if (!srcEl) return null;
@@ -1336,74 +1589,82 @@
         var clone = srcEl.cloneNode(true);
         wrapper.appendChild(clone);
         var shadow = wrapper.attachShadow({ mode: 'open' });
-        while (wrapper.firstChild) {
-            shadow.appendChild(wrapper.firstChild);
-        }
+        while (wrapper.firstChild) shadow.appendChild(wrapper.firstChild);
         var clipboard = {
             el: wrapper,
             paste: function(dest) {
                 if (!dest) return clipboard;
                 var destEl = utils.resolveHost(dest);
-                if (destEl) {
-                    destEl.appendChild(wrapper);
-                }
+                if (destEl) destEl.appendChild(wrapper);
                 return clipboard;
             }
         };
-        if (target) {
-            clipboard.paste(target);
-        }
+        if (target) clipboard.paste(target);
         return clipboard;
     };
 
     // ============================================================
-    // 接管原生 Shadow DOM
+    // takeOver
     // ============================================================
-    (function() {
-        if (Element.prototype.__sdit_attachShadow) return;
-        var origAttachShadow = Element.prototype.attachShadow;
-        Element.prototype.__sdit_attachShadow = true;
+    var _takeOver = false, _origAttachShadow = null, _hijackInstalled = false;
+
+    function _installHijack() {
+        if (_hijackInstalled) return;
+        _hijackInstalled = true;
+        _origAttachShadow = Element.prototype.attachShadow;
         Element.prototype.attachShadow = function(init) {
-            var root = origAttachShadow.call(this, init);
-            if (init && init.mode === 'open') {
-                var name = this.getAttribute('data-sdit-name') || this.id ||
-                    (this.tagName ? this.tagName.toLowerCase() : 'el') + '-' + Date.now().toString(36);
-                var store = shadowit._instanceStore || shadowit.instance;
-                if (!store[name]) {
+            var root = _origAttachShadow.call(this, init);
+            if (_takeOver && init && init.mode === 'open') {
+                if (!shadowit._instances.has(this)) {
+                    // 如果该元素已有 ShadowRoot（由其他库创建），直接关联，不重复创建实例
+                    var name = this.getAttribute('data-sdit-name') || this.id ||
+                        (this.tagName ? this.tagName.toLowerCase() : 'el') + '-' + Date.now().toString(36);
                     var inst = new ShadowIt(null, { name: name });
-                    inst._host = this;
-                    inst._root = root;
-                    inst._mounted = true;
-                    inst._rendered = true;
-                    store[name] = inst;
+                    inst._host = this; inst._root = root;
+                    inst._mounted = true; inst._rendered = true;
+                    shadowit._instances.set(this, inst);
+                    shadowit._nameMap[name] = inst;
                 }
             }
             return root;
         };
-    })();
+    }
+
+    function _uninstallHijack() {
+        if (!_hijackInstalled) return;
+        _hijackInstalled = false;
+        if (_origAttachShadow) { Element.prototype.attachShadow = _origAttachShadow; _origAttachShadow = null; }
+    }
+
+    Object.defineProperty(shadowit, 'takeOver', {
+        get: function() { return _takeOver; },
+        set: function(val) {
+            if (typeof val !== 'boolean') { console.warn('[shadowit] takeOver 必须是布尔值 (true/false)，已忽略'); return; }
+            _takeOver = val;
+            val ? _installHijack() : _uninstallHijack();
+        },
+        enumerable: true, configurable: false
+    });
 
     // ============================================================
     // 自定义标签注册
     // ============================================================
     shadowit.define = function(name, tpl, css) {
-        // 新签名: sdit.define(name, tpl, css)
         if (utils.isString(tpl) && !utils.isObject(arguments[1])) {
             var opts = { template: tpl };
             if (css) opts.css = css;
             return shadowit._define(name, opts);
         }
-        // 旧签名: sdit.define(name, options)
         return shadowit._define(name, tpl || {});
     };
 
     shadowit._define = function(tagName, options) {
-        if (!tagName.includes('-')) {
-            throw new Error('[shadowit] 自定义标签名必须包含中划线 "-"，例如 "my-component"');
-        }
+        if (!tagName.includes('-')) throw new Error('[shadowit] 自定义标签名必须包含中划线 "-"');
 
         var template = options.template || '';
         var cssVal = options.css || options.styles || '';
         var data = options.data || {};
+        var mode = options.mode || 'open';               // 支持 mode 配置
         var lifecycle = options.lifecycle || {};
         var observedAttributes = options.observedAttributes || [];
         var attributeChanged = options.attributeChanged || null;
@@ -1420,8 +1681,7 @@
             for (var key in data) { if (data.hasOwnProperty(key)) self._data[key] = data[key]; }
             self._instanceName = cname || (tagName + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4));
             self._attributeChangedHandler = attributeChanged;
-            self._template = template;
-            self._css = cssVal;
+            self._template = template; self._css = cssVal; self._mode = mode;
             return self;
         }
         ShadowItElement.prototype = Object.create(HTMLElement.prototype);
@@ -1431,38 +1691,27 @@
             if (this._instance) return;
             for (var i = 0; i < observedAttributes.length; i++) {
                 var attr = observedAttributes[i];
-                if (this.hasAttribute(attr)) {
-                    this._data[attr] = this.getAttribute(attr);
-                }
+                if (this.hasAttribute(attr)) this._data[attr] = this.getAttribute(attr);
             }
             var self = this;
-            this._instance = shadowit(this, {
-                template: this._template,
-                css: this._css,
-                data: this._data,
-                name: this._instanceName,
-                onError: onError,
-                eventsOnHost: eventsOnHost,
+            var shadowitInst = shadowit(this, {
+                template: this._template, css: this._css, mode: this._mode,
+                data: this._data, name: this._instanceName,
+                onError: onError, eventsOnHost: eventsOnHost,
                 lifecycle: {
-                    beforeRender: lifecycle.beforeRender || null,
-                    afterRender: function() {
-                        if (lifecycle.afterRender) lifecycle.afterRender.call(self);
-                    },
-                    beforeUpdate: lifecycle.beforeUpdate || null,
-                    afterUpdate: lifecycle.afterUpdate || null,
-                    destroy: function() {
-                        if (lifecycle.destroy) lifecycle.destroy.call(self);
-                    }
+                    beforeRender: lifecycle.beforeRender ? function() { lifecycle.beforeRender.call(self); } : null,
+                    afterRender: function(data) { if (lifecycle.afterRender) lifecycle.afterRender.call(self, data); },
+                    beforeUpdate: lifecycle.beforeUpdate ? function(newData, oldData) { lifecycle.beforeUpdate.call(self, newData, oldData); } : null,
+                    afterUpdate: lifecycle.afterUpdate ? function(newData, currentData) { lifecycle.afterUpdate.call(self, newData, currentData); } : null,
+                    destroy: function() { if (lifecycle.destroy) lifecycle.destroy.call(self); }
                 }
             });
+            this._instance = shadowitInst;
             if (connected) connected.call(this);
         };
 
         ShadowItElement.prototype.disconnectedCallback = function() {
-            if (this._instance) {
-                this._instance.destroy();
-                this._instance = null;
-            }
+            if (this._instance) { this._instance.destroy(); this._instance = null; }
             if (disconnected) disconnected.call(this);
         };
 
@@ -1471,84 +1720,35 @@
             if (this._attributeChangedHandler) {
                 this._attributeChangedHandler.call(this, attrName, oldVal, newVal);
             } else {
-                if (this._instance) {
-                    var d = {}; d[attrName] = newVal;
-                    this._instance.update(d);
-                } else {
-                    this._data[attrName] = newVal;
-                }
+                if (this._instance) { var d = {}; d[attrName] = newVal; this._instance.update(d); }
+                else { this._data[attrName] = newVal; }
             }
         };
 
-        Object.defineProperty(ShadowItElement, 'observedAttributes', {
-            get: function() { return observedAttributes; }
-        });
+        Object.defineProperty(ShadowItElement, 'observedAttributes', { get: function() { return observedAttributes; } });
 
-        if (!customElements.get(tagName)) {
-            customElements.define(tagName, ShadowItElement);
-        }
+        if (!customElements.get(tagName)) customElements.define(tagName, ShadowItElement);
 
-        // 返回代理对象，包含 .destroy, .on, .off, .data, .template, .css
         return {
-            _tagName: tagName,
-            _elementClass: ShadowItElement,
-            _getStore: function() { return shadowit._instanceStore || shadowit.instance; },
+            _tagName: tagName, _elementClass: ShadowItElement,
             _getInstances: function() {
-                var store = this._getStore();
                 var result = [];
-                for (var k in store) {
-                    if (store.hasOwnProperty(k) && store[k] && store[k]._host && store[k]._host.tagName === tagName.toUpperCase()) {
-                        result.push(store[k]);
-                    }
+                var names = Object.keys(shadowit._nameMap);
+                for (var i = 0; i < names.length; i++) {
+                    var inst = shadowit._nameMap[names[i]];
+                    if (inst && inst._host && inst._host.tagName === tagName.toUpperCase()) result.push(inst);
                 }
                 return result;
             },
-            destroy: function() {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].destroy();
-                }
-            },
-            on: function(event, selector, handler) {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].on(event, selector, handler);
-                }
-                return this;
-            },
-            off: function(event, selector, handler) {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].off(event, selector, handler);
-                }
-                return this;
-            },
-            data: function(newData) {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].data(newData);
-                }
-                return this;
-            },
-            template: function(tpl) {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].template(tpl);
-                    insts[i].render();
-                }
-                return this;
-            },
-            css: function(cssStr) {
-                var insts = this._getInstances();
-                for (var i = 0; i < insts.length; i++) {
-                    insts[i].css(cssStr);
-                }
-                return this;
-            }
+            destroy: function() { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) insts[i].destroy(); },
+            on: function(event, selector, handler) { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) insts[i].on(event, selector, handler); return this; },
+            off: function(event, selector, handler) { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) insts[i].off(event, selector, handler); return this; },
+            data: function(newData) { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) insts[i].data(newData); return this; },
+            template: function(tpl) { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) { insts[i].template(tpl); insts[i].render(); } return this; },
+            css: function(cssStr) { var insts = this._getInstances(); for (var i = 0; i < insts.length; i++) insts[i].css(cssStr); return this; }
         };
     };
 
-    // 别名
     shadowit.sdit = shadowit;
     shadowit.shadowIt = shadowit;
 
