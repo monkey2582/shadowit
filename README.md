@@ -1,4 +1,4 @@
-ShadowIt
+# ShadowIt
 
 ShadowIt 是一个轻量级的 Shadow DOM 模板引擎，语法像 Vue，体积像 Alpine，封装像 Web Components。
 
