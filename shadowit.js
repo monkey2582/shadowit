@@ -7,7 +7,7 @@
  * @bind 双向绑定、computed 计算属性、Proxy 深响应式、
  * #await 异步块、#portal 传送门
  * https://github.com/monkey2582/shadowit
- * @version 1.4.1
+ * @version 1.4.2
  */
 (function (global, factory) {
     if (typeof module === 'object' && typeof module.exports === 'object') {
@@ -679,6 +679,7 @@
         this._root = null;
         this._lastHtml = '';
         this._delegatedEvents = null;
+        this._groupInstances = [];  // 多宿主组实例（sdit([...]) 时追踪）
 
         this._lifecycle = {
             beforeRender: this.options.lifecycle.beforeRender || null,
@@ -702,17 +703,22 @@
 
     ShadowIt._rootSeed = 0;
 
-    ShadowIt.prototype.mount = function(host) {
-        if (this._destroyed) throw new Error('[shadowit] 实例已销毁，无法挂载');
-        if (this._mounted) throw new Error('[shadowit] 实例已经挂载，不能重复挂载');
-        if (!host) throw new Error('[shadowit] mount() 需要指定宿主元素');
-
-        this._host = typeof host === 'string' ? document.querySelector(host) : host;
-        if (!this._host) throw new Error('[shadowit] 宿主元素未找到: ' + host);
-
+    ShadowIt.prototype._mountOne = function(hostEl) {
+        if (!hostEl) throw new Error('[shadowit] 宿主元素未找到');
+        this._host = hostEl;
         this._root = this._host.attachShadow({ mode: this.options.mode });
         this._mounted = true;
         shadowit._instances.set(this._host, this);
+
+        // 自动 template：如果 template 为空，取宿主子元素作为模板
+        var tpl = this.options.template;
+        if (!tpl || (utils.isString(tpl) && tpl.trim() === '')) {
+            var hostHTML = this._host.innerHTML;
+            if (hostHTML && hostHTML.trim()) {
+                this.options.template = hostHTML;
+                this._host.innerHTML = '';
+            }
+        }
 
         var self = this;
         var eventRoot = this.options.eventsOnHost ? this._host : this._root;
@@ -720,20 +726,96 @@
             eventRoot,
             function() { return self._data; },
             function() { return self.options.methods; },
-            // @bind 回调：自动回写数据并触发更新
             function(path, value) {
                 utils._setNested(self._data, path, value);
                 self.update();
             }
         );
 
-        // 启用 Proxy 响应式（默认开启）
         if (this.options.reactive && typeof Proxy !== 'undefined') {
             this._makeReactive();
         }
 
         this._applyCSS();
         this.render();
+        return this;
+    };
+
+    ShadowIt.prototype.mount = function(host) {
+        if (this._destroyed) throw new Error('[shadowit] 实例已销毁，无法挂载');
+
+        // 支持数组：sdit(...).mount([el1, el2, ...])
+        if (utils.isArray(host) || (host && typeof host.length === 'number' && host.item)) {
+            var hosts = shadowit._resolveHosts(host);
+            if (hosts.length === 0) throw new Error('[shadowit] mount() 未找到任何有效宿主元素');
+            // 第一个宿主用当前实例挂载
+            var firstHost = hosts[0];
+            if (this._mounted) {
+                // 已有旧宿主，先 detach
+                this._detachFromHost();
+            }
+            this._mountOne(firstHost);
+            // 剩余宿主创建新实例并加入组（共享当前 template/css/data）
+            if (!this._groupInstances) this._groupInstances = [];
+            for (var i = 1; i < hosts.length; i++) {
+                var clone = new ShadowIt(hosts[i], {
+                    template: this.options.template,
+                    css: this.options.css,
+                    data: utils.deepClone(this._data),
+                    mode: this.options.mode,
+                    lifecycle: this.options.lifecycle,
+                    onError: this.options.onError,
+                    eventsOnHost: this.options.eventsOnHost,
+                    methods: this.options.methods,
+                    computed: this.options.computed,
+                    reactive: this.options.reactive
+                });
+                this._groupInstances.push(clone);
+            }
+            return this;
+        }
+
+        if (!host) throw new Error('[shadowit] mount() 需要指定宿主元素');
+
+        // 单个 host，支持选择器字符串
+        var hostEl = utils.isString(host) ? document.querySelector(host) : host;
+        if (!hostEl) throw new Error('[shadowit] 宿主元素未找到: ' + host);
+
+        if (this._mounted) {
+            // 重复挂载：先 detach 旧宿主
+            this._detachFromHost();
+        }
+
+        this._mountOne(hostEl);
+        return this;
+    };
+
+    // 从旧宿主 detach（保留数据和配置，不销毁实例）
+    ShadowIt.prototype._detachFromHost = function() {
+        if (this._delegatedEvents) { this._delegatedEvents.destroy(); this._delegatedEvents = null; }
+        if (this._root) { this._root.innerHTML = ''; this._root = null; }
+        if (this._host) { shadowit._instances.delete(this._host); this._host = null; }
+        this._mounted = false;
+        this._rendered = false;
+        this._lastHtml = '';
+        this._queryCache.clear();
+        this._onceCache = {};
+        this._updateScheduled = false;
+    };
+
+    // 卸载实例（与 mount 相反，保留数据和配置，可重新挂载）
+    ShadowIt.prototype.unmount = function() {
+        if (this._destroyed) return this;
+        // 先卸载组内所有实例
+        if (this._groupInstances && this._groupInstances.length > 0) {
+            for (var i = 0; i < this._groupInstances.length; i++) {
+                if (this._groupInstances[i] && !this._groupInstances[i]._destroyed) {
+                    this._groupInstances[i]._detachFromHost();
+                }
+            }
+            this._groupInstances = [];
+        }
+        if (this._mounted) this._detachFromHost();
         return this;
     };
 
@@ -1290,6 +1372,19 @@
     ShadowIt.prototype.getName = function() { return this._name; };
     ShadowIt.prototype.getId = function() { return this._id; };
 
+    // 获取多宿主组中的所有实例（含自身）
+    ShadowIt.prototype.getGroupInstances = function() {
+        var result = [this];
+        if (this._groupInstances && this._groupInstances.length > 0) {
+            for (var i = 0; i < this._groupInstances.length; i++) {
+                if (this._groupInstances[i] && !this._groupInstances[i]._destroyed) {
+                    result.push(this._groupInstances[i]);
+                }
+            }
+        }
+        return result;
+    };
+
     // ----- 快捷方法 -----
     ShadowIt.prototype.getHTML = function() { return this._root ? this._root.innerHTML : ''; };
 
@@ -1373,6 +1468,15 @@
     // ----- destroy -----
     ShadowIt.prototype.destroy = function() {
         if (this._destroyed) return this;
+        // 先销毁组内所有实例
+        if (this._groupInstances && this._groupInstances.length > 0) {
+            for (var gi = 0; gi < this._groupInstances.length; gi++) {
+                if (this._groupInstances[gi] && !this._groupInstances[gi]._destroyed) {
+                    this._groupInstances[gi].destroy();
+                }
+            }
+            this._groupInstances = null;
+        }
         try { this._callHook('destroy'); }
         catch (err) { this._handleError(err, 'destroy'); }
         if (this._delegatedEvents) { this._delegatedEvents.destroy(); this._delegatedEvents = null; }
@@ -1448,20 +1552,127 @@
     // ============================================================
     // 全局 shadowit 函数
     // ============================================================
+
+    // 将混合输入（选择器字符串、Element、NodeList、数组）扁平化为 Element 数组
+    shadowit._resolveHosts = function(input) {
+        if (!input) return [];
+        var results = [];
+        function collect(item) {
+            if (!item) return;
+            if (item instanceof Element) { results.push(item); return; }
+            if (utils.isString(item)) {
+                try {
+                    var els = document.querySelectorAll(item);
+                    for (var i = 0; i < els.length; i++) results.push(els[i]);
+                } catch (e) {}
+                return;
+            }
+            if (item.length !== undefined && typeof item.length === 'number') {
+                for (var j = 0; j < item.length; j++) collect(item[j]);
+                return;
+            }
+        }
+        if (utils.isArray(input)) {
+            for (var k = 0; k < input.length; k++) collect(input[k]);
+        } else {
+            collect(input);
+        }
+        return results;
+    };
+
     function shadowit(host, options) {
+        // ---- sdit({}) 纯选项对象（支持 el 属性指定宿主） ----
+        if (host && typeof host === 'object' && !(host instanceof Element) && !utils.isArray(host) && !utils.isString(host) && typeof host.length !== 'number') {
+            var opts = host;
+            var el = opts.el;
+            if (el) {
+                var hosts = shadowit._resolveHosts(el);
+                // 从 options 中移除 el（避免污染 data）
+                var cleanOpts = {};
+                for (var k in opts) { if (k !== 'el') cleanOpts[k] = opts[k]; }
+                if (hosts.length === 0) {
+                    var inst = new ShadowIt(null, cleanOpts);
+                    if (utils.isString(el)) { inst._pendingSelector = el; inst._startObserver(); }
+                    return inst;
+                }
+                var firstHost = hosts[0];
+                var firstInst = new ShadowIt(firstHost, cleanOpts);
+                if (hosts.length === 1) return firstInst;
+                firstInst._groupInstances = [];
+                for (var i = 1; i < hosts.length; i++) {
+                    var clone = new ShadowIt(hosts[i], {
+                        template: firstInst.options.template,
+                        css: firstInst.options.css,
+                        data: utils.deepClone(firstInst._data),
+                        mode: firstInst.options.mode,
+                        lifecycle: firstInst.options.lifecycle,
+                        onError: firstInst.options.onError,
+                        eventsOnHost: firstInst.options.eventsOnHost,
+                        methods: firstInst.options.methods,
+                        computed: firstInst.options.computed,
+                        reactive: firstInst.options.reactive
+                    });
+                    firstInst._groupInstances.push(clone);
+                }
+                return firstInst;
+            }
+            return new ShadowIt(null, opts);
+        }
+
+        // ---- sdit([...]) / sdit([...], {}) 数组多宿主（返回首个实例，带组追踪） ----
+        if (utils.isArray(host) || (host && typeof host.length === 'number' && host.item)) {
+            var hosts = shadowit._resolveHosts(host);
+            if (hosts.length === 0) {
+                if (options) return new ShadowIt(null, options);
+                return new ShadowIt(null, {});
+            }
+            var opts = (options && typeof options === 'object' && !(options instanceof Element) && !utils.isString(options)) ? options : {};
+            var firstHost = hosts[0];
+            var firstInst = new ShadowIt(firstHost, opts);
+            if (hosts.length === 1) return firstInst;
+            firstInst._groupInstances = [];
+            for (var i = 1; i < hosts.length; i++) {
+                var clone = new ShadowIt(hosts[i], {
+                    template: firstInst.options.template,
+                    css: firstInst.options.css,
+                    data: utils.deepClone(firstInst._data),
+                    mode: firstInst.options.mode,
+                    lifecycle: firstInst.options.lifecycle,
+                    onError: firstInst.options.onError,
+                    eventsOnHost: firstInst.options.eventsOnHost,
+                    methods: firstInst.options.methods,
+                    computed: firstInst.options.computed,
+                    reactive: firstInst.options.reactive
+                });
+                firstInst._groupInstances.push(clone);
+            }
+            return firstInst;
+        }
+
+        // ---- sdit(el) 单元素无选项 ----
+        if (host instanceof Element && arguments.length === 1) {
+            return new ShadowIt(host, {});
+        }
+
+        // ---- sdit(el, {}) 单元素 + 选项 ----
+        if (host instanceof Element && options && typeof options === 'object' && !utils.isString(options)) {
+            return new ShadowIt(host, options);
+        }
+
+        // ---- 旧版兼容：字符串简写 ----
         if (utils.isString(host) && arguments.length >= 2) {
             var arg1 = arguments[0], arg2 = arguments[1], arg3 = arguments[2];
             if (utils.isCSS(arg2)) {
-                var opts = { template: arg1, css: arg2 };
+                var opts2 = { template: arg1, css: arg2 };
                 if (arg3) {
                     var h = utils.resolveHost(arg3);
-                    if (h) return new ShadowIt(h, opts);
+                    if (h) return new ShadowIt(h, opts2);
                     if (utils.isString(arg3)) {
-                        var inst = new ShadowIt(null, opts);
+                        var inst = new ShadowIt(null, opts2);
                         inst._pendingSelector = arg3; inst._startObserver(); return inst;
                     }
                 }
-                return new ShadowIt(null, opts);
+                return new ShadowIt(null, opts2);
             }
             if (arg2 instanceof Element) return new ShadowIt(arg2, { template: arg1 });
             if (utils.isString(arg2)) {
@@ -1471,19 +1682,24 @@
                 inst2._pendingSelector = arg2; inst2._startObserver(); return inst2;
             }
         }
-        if (host && typeof host === 'object' && !(host instanceof Element) && !utils.isString(host)) {
-            return new ShadowIt(null, host);
-        }
+
+        // ---- 旧版兼容：options 是字符串/函数 → 当作 template ----
         if (utils.isString(options) || utils.isFunction(options)) options = { template: options };
         if (!options) options = {};
-        if (utils.isString(host) && !document.querySelector(host)) {
-            var inst = new ShadowIt(null, options);
-            inst._pendingSelector = host; inst._startObserver(); return inst;
+
+        // ---- sdit('#selector') 选择器字符串 ----
+        if (utils.isString(host)) {
+            if (!document.querySelector(host)) {
+                var inst3 = new ShadowIt(null, options);
+                inst3._pendingSelector = host; inst3._startObserver(); return inst3;
+            }
+            return new ShadowIt(host, options);
         }
+
         return new ShadowIt(host, options);
     }
 
-    shadowit.version = '1.4.1';
+    shadowit.version = '1.4.2';
     shadowit.utils = utils;
     shadowit.ShadowIt = ShadowIt;
     shadowit.isSupported = isSupported;

@@ -1,5 +1,5 @@
 /**
- * shadowit - Shadow DOM 控制库 v1.4.0
+ * shadowit - Shadow DOM 控制库 v1.4.2
  * TypeScript 类型定义
  * https://github.com/monkey2582/shadowit
  */
@@ -41,12 +41,19 @@ export interface LifecycleHooks {
 // ShadowIt 实例选项
 // ============================================================
 export interface ShadowItOptions {
-  /** HTML 模板字符串，或返回模板字符串的函数 */
+  /** HTML 模板字符串，或返回模板字符串的函数（为空时自动取宿主子元素作为模板） */
   template?: string | ((data: Record<string, any>) => string);
   /** CSS 样式字符串，或返回样式字符串的函数（v1.2.0 新增函数支持） */
   css?: string | ((data: Record<string, any>) => string);
   /** CSS 样式字符串（css 别名） */
   styles?: string | ((data: Record<string, any>) => string);
+  /**
+   * 宿主元素选择器/元素/数组（v1.4.2 新增）
+   * 支持字符串选择器、Element、NodeList、数组（可混合）
+   * @example el: '#app'
+   * @example el: ['.a', document.querySelectorAll('.b'), '.c']
+   */
+  el?: string | Element | Array<string | Element | NodeList> | NodeList;
   /** 初始数据对象 */
   data?: Record<string, any>;
   /** Shadow Root 模式：'open'（默认）或 'closed' */
@@ -68,9 +75,9 @@ export interface ShadowItOptions {
    */
   computed?: Record<string, (data: Record<string, any>) => any>;
   /**
-   * 是否启用 Proxy 响应式自动更新（v1.4.0 新增，默认 true）
-   * 开启后，直接修改 instance.data 属性会自动触发更新，无需手动调用 update()。
-   * 注意：仅支持顶层属性修改，嵌套路径请使用 update()。
+   * 是否启用 Proxy 深响应式自动更新（v1.4.0 新增，v1.4.1 改为递归深代理）
+   * 开启后，直接修改嵌套属性（如 data.user.name = 'new'）也会自动触发更新。
+   * 可通过 reactive: false 关闭。
    * @default true
    */
   reactive?: boolean;
@@ -80,8 +87,14 @@ export interface ShadowItOptions {
 // ShadowIt 实例
 // ============================================================
 export interface ShadowItInstance {
-  /** 挂载到宿主元素（构造函数中已自动调用） */
-  mount(host: string | Element): this;
+  /**
+   * 挂载到宿主元素（构造函数中已自动调用）
+   * 支持单个宿主、数组（含混合类型：选择器字符串、Element、NodeList）
+   * 重复挂载会先 detach 旧宿主
+   * @example mount('#app')
+   * @example mount(['.a', document.querySelectorAll('.b'), '.c'])
+   */
+  mount(host: string | Element | Array<string | Element | NodeList> | NodeList): this;
 
   /** 设置模板 */
   template(html: string | ((data: Record<string, any>) => string)): this;
@@ -165,6 +178,15 @@ export interface ShadowItInstance {
   /** 获取实例 ID */
   getId(): string;
 
+  /**
+   * 获取多宿主组中的所有实例（v1.4.2 新增）
+   * 当通过 sdit([...]) 或 mount([...]) 创建多宿主时，返回包含所有实例的数组
+   */
+  getGroupInstances(): ShadowItInstance[];
+
+  /** 卸载实例（与 mount 相反，保留数据和配置，可重新挂载） */
+  unmount(): this;
+
   /** 销毁实例 */
   destroy(): this;
 }
@@ -245,31 +267,6 @@ export interface ShadowItCopyClipboard {
 }
 
 // ============================================================
-// DevTools 调试钩子（v1.4.0 新增）
-// ============================================================
-export interface ShadowItDevTools {
-  /** 版本号 */
-  version: string;
-  /** 获取所有活跃实例 */
-  getAll(): ShadowItInstance[];
-  /** 按名称获取实例 */
-  get(name: string): ShadowItInstance | null;
-  /** 按宿主选择器获取实例 */
-  getByHost(selector: string): ShadowItInstance | null;
-  /** 列出所有实例摘要 */
-  list(): Array<{
-    index: number;
-    name: string | null;
-    id: string;
-    host: string;
-    rendered: boolean;
-    mounted: boolean;
-    destroyed: boolean;
-    data: Record<string, any>;
-  }>;
-}
-
-// ============================================================
 // 全局 shadowit 函数
 // ============================================================
 
@@ -277,19 +274,23 @@ export interface ShadowItDevTools {
  * 创建 ShadowIt 实例
  *
  * @example
+ * // 纯选项对象（可含 el 指定宿主）
+ * sdit({ el: '#app', template: '<div>{{name}}</div>', css: 'div { color: red; }' })
+ *
  * // 完整配置
  * shadowit(hostEl, { template: '<div>{{name}}</div>', css: 'div { color: red; }' })
  *
  * // 简写：template + css
  * shadowit('<div>{{name}}</div>', 'div { color: red; }')
  *
- * // 简写：template + css + 宿主选择器
- * shadowit('<div>{{name}}</div>', 'div { color: red; }', '#app')
+ * // 数组多宿主（自动 template 取首个宿主子元素，返回首个实例，可链式 .mount()）
+ * shadowit(['.a', document.querySelectorAll('.b'), '.c'])
+ *   .mount(['.d'])
  */
 export interface ShadowItFunction {
-  (host: string | Element, options: ShadowItOptions): ShadowItInstance;
-  (template: string, css: string, host?: string | Element): ShadowItInstance;
+  (host: string | Element | Array<string | Element | NodeList> | NodeList, options?: ShadowItOptions): ShadowItInstance;
   (options: ShadowItOptions): ShadowItInstance;
+  (template: string, css: string, host?: string | Element): ShadowItInstance;
 
   /** 版本号 */
   version: string;
@@ -318,6 +319,7 @@ export interface ShadowItFunction {
     parseEventExpr(expr: string): { name: string; args: any[] };
     _setNested(obj: any, path: string, value: any): void;
     _splitAwaitBranches(content: string): { loading: string; then: string; thenVar: string | null; catch: string; catchVar: string | null };
+    _findClosingBraces(template: string, startPos: number): number;
   };
 
   /** 浏览器是否支持 Shadow DOM */
@@ -416,23 +418,4 @@ declare global {
   const sdit: ShadowItFunction;
   const ShadowIt: new (host?: string | Element | null, options?: ShadowItOptions) => ShadowItInstance;
   const shadowIt: ShadowItFunction;
-
-  /** DevTools 调试钩子（v1.4.0 新增） */
-  const __SHADOWIT_DEVTOOLS__: ShadowItDevTools;
-
-  /**
-   * 快捷调试函数（v1.4.0 新增）
-   * $s('myComponent') — 获取实例
-   * $s() — 列出所有实例
-   */
-  function $s(name?: string): ShadowItInstance | null | Array<{
-    index: number;
-    name: string | null;
-    id: string;
-    host: string;
-    rendered: boolean;
-    mounted: boolean;
-    destroyed: boolean;
-    data: Record<string, any>;
-  }>;
 }
