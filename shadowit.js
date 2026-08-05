@@ -531,7 +531,15 @@
         var bindings = { texts: [], shows: [], ifs: [], fors: [], awaits: [], onces: [] };
 
         function walk(node) {
-            if (node.nodeType !== 1) return;
+            if (node.nodeType !== 1 && node.nodeType !== 11) return;
+            // DocumentFragment/ShadowRoot 没有 tagName，直接遍历子节点
+            if (node.nodeType === 11) {
+                var fragChildren = node.childNodes;
+                for (var fc = 0; fc < fragChildren.length; fc++) {
+                    walk(fragChildren[fc]);
+                }
+                return;
+            }
             var tag = node.tagName.toLowerCase();
 
             if (tag === 's-text') {
@@ -694,17 +702,36 @@
             (utils.isFunction(methods[h.handlerName]) ? methods[h.handlerName] : null);
         if (!fn) return;
 
+        // 从触发元素向上查找 s-k 上下文（for 循环局部变量）
+        var ctxData = data;
+        var walkEl = el;
+        while (walkEl && walkEl !== this._root) {
+            if (walkEl.__sdit_ctx) {
+                ctxData = walkEl.__sdit_ctx;
+                break;
+            }
+            walkEl = walkEl.parentNode;
+        }
+
         var resolvedArgs = [];
         for (var i = 0; i < h.parsedArgs.length; i++) {
             var arg = h.parsedArgs[i];
             if (arg && typeof arg === 'object' && arg.$path) {
-                var val = utils.getNested(data, arg.$path);
+                // 优先级：s-k 上下文 > 顶层 data > methods
+                var val = utils.getNested(ctxData, arg.$path);
+                if (val === undefined) val = utils.getNested(data, arg.$path);
+                if (val === undefined) val = utils.getNested(methods, arg.$path);
                 resolvedArgs.push(val !== undefined ? val : arg.$path);
             } else {
                 resolvedArgs.push(arg);
             }
         }
-        fn.apply(el, [e, el].concat(resolvedArgs));
+        // 有显式参数时只传解析后的参数，无参数时才注入 e 和 el
+        if (h.parsedArgs.length > 0) {
+            fn.apply(el, resolvedArgs);
+        } else {
+            fn.apply(el, [e, el]);
+        }
         // 微响应式：事件处理后自动更新视图
         if (this._shadowItInstance && !this._shadowItInstance._destroyed) {
             this._shadowItInstance.update();
@@ -1027,6 +1054,28 @@
                 this._lastHtml = html;
 
                 this._bindings = compileBindings(this._root);
+
+                // 首次渲染后，为 s-k 元素设置上下文（用于事件参数解析）
+                var fors = this._bindings.fors;
+                for (var ffi = 0; ffi < fors.length; ffi++) {
+                    var ffb = fors[ffi];
+                    var fforMatch = ffb.expr.match(/^(\w+)\s+of\s+([\w.]+)$/);
+                    if (!fforMatch) continue;
+                    var fitemName = fforMatch[1];
+                    var fitemsPath = fforMatch[2];
+                    var fitems = utils.getNested(this._data, fitemsPath);
+                    if (!utils.isArray(fitems)) fitems = [];
+                    var fskChildren = ffb.node.querySelectorAll(':scope > s-k');
+                    for (var fsi = 0; fsi < fskChildren.length && fsi < fitems.length; fsi++) {
+                        var fctx = {};
+                        for (var fdk in this._data) { if (this._data.hasOwnProperty(fdk)) fctx[fdk] = this._data[fdk]; }
+                        fctx.index = fsi;
+                        fctx.parent = this._data;
+                        fctx[fitemName] = fitems[fsi];
+                        fskChildren[fsi].__sdit_ctx = fctx;
+                    }
+                }
+
                 this._delegatedEvents.scan();
                 this._queryCache.clear();
                 if (shadowit._cacheEnabled) shadowit.clearQueryCache();
@@ -1149,6 +1198,7 @@
             }
         }
 
+        var keyCtxMap = {};
         var newKeyedChildren = [];
         var newHtmlParts = [];
         for (var fi = 0; fi < items.length; fi++) {
@@ -1159,6 +1209,7 @@
             var keyVal = '__idx_' + fi;
             if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
             ctx['@key'] = keyVal;
+            keyCtxMap[keyVal] = ctx;
             var itemRendered = utils._processTokens(tokens, 0, ctx, this._onceCache, null);
             newKeyedChildren.push({ key: keyVal, html: itemRendered });
             newHtmlParts.push('<s-k data-key="' + keyVal + '">' + itemRendered + '</s-k>');
@@ -1191,6 +1242,8 @@
             var nk = newKeyedChildren[nci].key;
             var oldNode = oldKeyMap[nk];
             if (oldNode) {
+                // 更新上下文（数据可能已变化）
+                oldNode.__sdit_ctx = keyCtxMap[nk];
                 if (oldNode.innerHTML !== newKeyedChildren[nci].html) {
                     oldNode.innerHTML = newKeyedChildren[nci].html;
                     // innerHTML 重建后，收集子节点及根节点用于事件重扫
@@ -1205,6 +1258,7 @@
                 var tempDiv = document.createElement('div');
                 tempDiv.innerHTML = newHtmlParts[nci];
                 var cloned = tempDiv.firstChild;
+                cloned.__sdit_ctx = keyCtxMap[nk];
                 newChildList.push(cloned);
                 // 收集新节点及其子树用于事件重扫
                 newNodes.push(cloned);
