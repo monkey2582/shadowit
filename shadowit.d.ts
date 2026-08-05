@@ -1,13 +1,63 @@
 /**
- * shadowit - Shadow DOM 控制库 v1.4.2
+ * shadowit - Shadow DOM 控制库 v2.0.0
  * TypeScript 类型定义
+ * 微响应式、模板预编译引擎、事件委托白名单
  * https://github.com/monkey2582/shadowit
  */
 
 // ============================================================
-// 生命周期钩子
+// setup() 返回值（扁平对象：函数 → methods，非函数 → data，computed 特殊）
 // ============================================================
-export interface LifecycleHooks {
+/**
+ * setup() 返回一个扁平对象，系统自动拆分：
+ * - 键为 'computed' 且值为对象 → 计算属性
+ * - 值为函数的键 → 方法（供事件委托查找）
+ * - 值为非函数的键 → 数据
+ *
+ * @example
+ * setup: () => ({
+ *   count: 0,              // → data
+ *   name: 'world',         // → data
+ *   inc() { this.count++ },// → methods
+ *   computed: {            // → computed
+ *     doubleCount: (data) => data.count * 2
+ *   }
+ * })
+ */
+
+// ============================================================
+// ShadowIt 实例选项
+// ============================================================
+export interface ShadowItOptions {
+  /** HTML 模板字符串，或返回模板字符串的函数（为空时自动取宿主子元素作为模板） */
+  template?: string | ((data: Record<string, any>) => string);
+  /** CSS 样式字符串，或返回样式字符串的函数 */
+  css?: string | ((data: Record<string, any>) => string);
+  /** CSS 样式字符串（css 别名） */
+  styles?: string | ((data: Record<string, any>) => string);
+  /**
+   * 宿主元素选择器/元素/数组
+   * 支持字符串选择器、Element、NodeList、数组（可混合）
+   * @example el: '#app'
+   * @example el: ['.a', document.querySelectorAll('.b'), '.c']
+   */
+  el?: string | Element | Array<string | Element | NodeList> | NodeList;
+  /**
+   * 统一初始化函数，返回扁平对象（数据和方法混写）
+   * @example setup: () => ({ count: 0, inc() { this.count++ } })
+   */
+  setup?: () => Record<string, any>;
+  /** Shadow Root 模式：'open'（默认）或 'closed' */
+  mode?: 'open' | 'closed';
+  /** 全局错误回调 */
+  onError?: ((err: Error, context: string) => void) | null;
+  /** 事件是否绑定在宿主元素上（默认在 Shadow Root 上） */
+  eventsOnHost?: boolean;
+  /** 实例名称（用于 shadowit.instance.name 访问） */
+  name?: string | null;
+
+  // ===== 生命周期钩子（顶层选项） =====
+
   /** 首次渲染前调用 */
   beforeRender?: (() => void) | null;
   /** 首次渲染后调用，参数为当前数据对象 */
@@ -25,7 +75,7 @@ export interface LifecycleHooks {
    */
   afterUpdate?: ((newData?: Record<string, any>, currentData?: Record<string, any>) => void) | null;
   /**
-   * 渲染前判断钩子（v1.2.0 新增，v1.3.0 调至数据合并后调用）
+   * 渲染前判断钩子
    * 在数据合并后调用，此时 this._data 已是最新状态。
    * 返回 false 可跳过本次渲染（数据已合并，仅跳过 DOM 更新）。
    * @param newData 本次更新的增量数据
@@ -35,52 +85,6 @@ export interface LifecycleHooks {
   shouldUpdate?: ((newData?: Record<string, any>, mergedData?: Record<string, any>) => boolean) | null;
   /** 实例销毁时调用 */
   destroy?: (() => void) | null;
-}
-
-// ============================================================
-// ShadowIt 实例选项
-// ============================================================
-export interface ShadowItOptions {
-  /** HTML 模板字符串，或返回模板字符串的函数（为空时自动取宿主子元素作为模板） */
-  template?: string | ((data: Record<string, any>) => string);
-  /** CSS 样式字符串，或返回样式字符串的函数（v1.2.0 新增函数支持） */
-  css?: string | ((data: Record<string, any>) => string);
-  /** CSS 样式字符串（css 别名） */
-  styles?: string | ((data: Record<string, any>) => string);
-  /**
-   * 宿主元素选择器/元素/数组（v1.4.2 新增）
-   * 支持字符串选择器、Element、NodeList、数组（可混合）
-   * @example el: '#app'
-   * @example el: ['.a', document.querySelectorAll('.b'), '.c']
-   */
-  el?: string | Element | Array<string | Element | NodeList> | NodeList;
-  /** 初始数据对象 */
-  data?: Record<string, any>;
-  /** Shadow Root 模式：'open'（默认）或 'closed' */
-  mode?: 'open' | 'closed';
-  /** 生命周期钩子 */
-  lifecycle?: LifecycleHooks;
-  /** 全局错误回调 */
-  onError?: ((err: Error, context: string) => void) | null;
-  /** 事件是否绑定在宿主元素上（默认在 Shadow Root 上） */
-  eventsOnHost?: boolean;
-  /** 实例名称（用于 shadowit.instance.name 访问） */
-  name?: string | null;
-  /** 外部方法映射（供事件委托查找） */
-  methods?: Record<string, (...args: any[]) => any>;
-  /**
-   * 计算属性（v1.4.0 新增）
-   * 每次渲染前计算，结果写入 data 中供模板使用。
-   * @example computed: { fullName: (data) => data.first + ' ' + data.last }
-   */
-  computed?: Record<string, (data: Record<string, any>) => any>;
-  /**
-   * 是否启用 Proxy 深响应式自动更新（v1.4.0 新增，v1.4.1 改为递归深代理）
-   * 开启后，直接修改嵌套属性（如 data.user.name = 'new'）也会自动触发更新。
-   * 可通过 reactive: false 关闭。
-   * @default true
-   */
-  reactive?: boolean;
 }
 
 // ============================================================
@@ -117,7 +121,10 @@ export interface ShadowItInstance {
   /** 渲染（首次使用，等同 update(null)） */
   render(): this;
 
-  /** 更新视图，可选传入增量数据 */
+  /**
+   * 更新视图，可选传入增量数据
+   * 事件处理后自动触发更新（微响应式）
+   */
   update(newData?: Record<string, any> | null): this;
 
   /**
@@ -129,7 +136,7 @@ export interface ShadowItInstance {
   on(event: string, selector: string, handler: (e: Event, el: Element) => void): this;
 
   /**
-   * 事件委托解绑（v1.2.0 支持精确卸载）
+   * 事件委托解绑
    * @param event 事件类型
    * @param selector 可选，CSS 选择器，传入则精确匹配
    * @param handler 可选，处理函数引用，传入则精确匹配
@@ -160,10 +167,10 @@ export interface ShadowItInstance {
   /** 在 Shadow Root 内查询多个元素 */
   querySelectorAll(selector: string, root?: Element | Document | string): Element[];
 
-  /** 缓存版 querySelector（自动 isConnected 失效） */
+  /** 缓存版 querySelector（自动 isConnected 失效，仅结构性 DOM 变化时清除缓存） */
   qS(selector: string, root?: Element | Document | string): Element | null;
 
-  /** 缓存版 querySelectorAll（自动 isConnected 失效） */
+  /** 缓存版 querySelectorAll（自动 isConnected 失效，仅结构性 DOM 变化时清除缓存） */
   qSAll(selector: string, root?: Element | Document | string): Element[];
 
   /** 获取 Shadow Root 内部 HTML */
@@ -179,7 +186,7 @@ export interface ShadowItInstance {
   getId(): string;
 
   /**
-   * 获取多宿主组中的所有实例（v1.4.2 新增）
+   * 获取多宿主组中的所有实例
    * 当通过 sdit([...]) 或 mount([...]) 创建多宿主时，返回包含所有实例的数组
    */
   getGroupInstances(): ShadowItInstance[];
@@ -197,16 +204,16 @@ export interface ShadowItInstance {
 export interface ShadowItDefineOptions {
   /** HTML 模板字符串 */
   template: string;
-  /** CSS 样式字符串，或返回样式字符串的函数（v1.2.0 新增函数支持） */
+  /** CSS 样式字符串，或返回样式字符串的函数 */
   css?: string | ((data: Record<string, any>) => string);
   /** CSS 样式字符串（css 别名） */
   styles?: string | ((data: Record<string, any>) => string);
-  /** 初始数据 */
-  data?: Record<string, any>;
+  /**
+   * 统一初始化函数，返回扁平对象（数据和方法混写）
+   */
+  setup?: () => Record<string, any>;
   /** Shadow Root 模式：'open'（默认）或 'closed' */
   mode?: 'open' | 'closed';
-  /** 生命周期钩子 */
-  lifecycle?: LifecycleHooks;
   /** 需要监听的 HTML 属性列表 */
   observedAttributes?: string[];
   /** 属性变化回调（未设置时自动更新到 data） */
@@ -221,15 +228,21 @@ export interface ShadowItDefineOptions {
   onError?: ((err: Error, context: string) => void) | null;
   /** 事件是否绑定在宿主元素上 */
   eventsOnHost?: boolean;
-  /**
-   * 计算属性（v1.4.0 新增）
-   * @example computed: { fullName: (data) => data.first + ' ' + data.last }
-   */
-  computed?: Record<string, (data: Record<string, any>) => any>;
-  /**
-   * 是否启用 Proxy 响应式（v1.4.0 新增，默认 true）
-   */
-  reactive?: boolean;
+
+  // ===== 生命周期钩子（顶层选项） =====
+
+  /** 首次渲染前调用 */
+  beforeRender?: (() => void) | null;
+  /** 首次渲染后调用 */
+  afterRender?: ((data: Record<string, any>) => void) | null;
+  /** 每次更新前调用 */
+  beforeUpdate?: ((newData?: Record<string, any>, oldData?: Record<string, any> | null) => void) | null;
+  /** 每次更新后调用 */
+  afterUpdate?: ((newData?: Record<string, any>, currentData?: Record<string, any>) => void) | null;
+  /** 渲染前判断钩子，返回 false 跳过渲染 */
+  shouldUpdate?: ((newData?: Record<string, any>, mergedData?: Record<string, any>) => boolean) | null;
+  /** 实例销毁时调用 */
+  destroy?: (() => void) | null;
 }
 
 // ============================================================
@@ -314,11 +327,11 @@ export interface ShadowItFunction {
     stripComments(template: string): string;
     escapeHtml(str: any): string;
     evalCondition(expr: string, data: Record<string, any>): boolean;
-    parseTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenContent: string; thenVar: string | null; catchContent: string; catchVar: string | null }>): string;
-    renderTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenContent: string; thenVar: string | null; catchContent: string; catchVar: string | null }>): string;
+    parseTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null }>): string;
+    renderTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null }>): string;
     parseEventExpr(expr: string): { name: string; args: any[] };
-    _setNested(obj: any, path: string, value: any): void;
-    _splitAwaitBranches(content: string): { loading: string; then: string; thenVar: string | null; catch: string; catchVar: string | null };
+    _tokenize(template: string): Array<{ type: string; value?: string; name?: string; arg?: string; cond?: string | null }>;
+    _processTokens(tokens: any[], startIdx: number, data: Record<string, any>, onceCache: Record<string, string>, pendingPromises: any[] | null): string;
     _findClosingBraces(template: string, startPos: number): number;
   };
 
@@ -394,10 +407,9 @@ export interface ShadowItFunction {
    *   template: '<div>Count: {{count}}</div>',
    *   css: 'div { font-weight: bold; }',
    *   mode: 'open',
-   *   data: { count: 0 },
-   *   computed: { doubleCount: (data) => data.count * 2 },
-   *   observedAttributes: ['count'],
-   *   lifecycle: { afterRender(data) { console.log('rendered', data); } }
+   *   setup: () => ({ count: 0, inc() { this.count++ }, computed: { doubleCount: (data) => data.count * 2 } }),
+ *   observedAttributes: ['count'],
+   *   afterRender(data) { console.log('rendered', data); }
    * })
    */
   define(tagName: string, template: string, css?: string): ShadowItDefineResult;

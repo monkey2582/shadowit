@@ -1,13 +1,9 @@
 /**
- * shadowit - Shadow DOM 控制库 v1.4.0
- * #for of + keyed diff、#else/#else-if/#elseif、{{--注释--}}、
- * {{#show}}、{{#once}}、事件委托 @click="handler(args)"、
- * 原生 <slot> 兼容、shouldUpdate 钩子、css 函数支持、
- * WeakMap 实例管理、takeOver 开关、
- * @bind 双向绑定、computed 计算属性、Proxy 深响应式、
- * #await 异步块、#portal 传送门
+ * shadowit - Shadow DOM 控制库 v2.0.0
+ * 微响应式、模板预编译引擎、事件委托白名单、模块隔离、
+ * CSS Display Toggle (#await)、内存泄漏修复、错误日志美化
  * https://github.com/monkey2582/shadowit
- * @version 1.4.2
+ * @version 2.0.0
  */
 (function (global, factory) {
     if (typeof module === 'object' && typeof module.exports === 'object') {
@@ -27,9 +23,8 @@
         return !!(document.createElement('div').attachShadow && window.customElements);
     };
 
-    // ============================================================
-    // 工具函数
-    // ============================================================
+    // ===== Module 1: Utils =====
+
     var utils = {
         isObject: function(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); },
         isFunction: function(v) { return typeof v === 'function'; },
@@ -102,12 +97,11 @@
             return template.replace(/\{\{--[\s\S]*?--\}\}/g, '');
         },
 
-        // 查找 }} 闭合标记，跳过字符串字面量内的 }}（避免误匹配）
         _findClosingBraces: function(template, startPos) {
             var inSingle = false, inDouble = false;
             for (var i = startPos; i < template.length - 1; i++) {
                 var ch = template[i];
-                if (ch === '\\') { i++; continue; } // 跳过转义字符
+                if (ch === '\\') { i++; continue; }
                 if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
                 if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
                 if (!inSingle && !inDouble && ch === '}' && template[i + 1] === '}') {
@@ -122,9 +116,7 @@
             return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         },
 
-        // ============================================================
-        // 纯路径条件求值 — 零 eval，零 XSS 风险
-        // ============================================================
+        // 纯路径条件求值
         evalCondition: function(expr, data) {
             if (!expr) return false;
             expr = expr.trim();
@@ -173,183 +165,296 @@
             return false;
         },
 
+        // 模板内容编码（用于存储到 data 属性中）
+        _encodeTemplate: function(tpl) {
+            return tpl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        },
+
         // ============================================================
-        // 栈式模板解析器
+        // Tokenizer 模板解析器（单次扫描 → token 数组 → 递归处理）
+        // 替代旧版 while + indexOf + _extractBlock 反复扫描
         // ============================================================
-        parseTemplate: function(template, data, onceCache, pendingPromises) {
-            if (!template) return '';
-            onceCache = onceCache || {};
-            pendingPromises = pendingPromises || null;
-            template = utils.stripComments(template);
-            var pos = 0, len = template.length, result = '';
+
+        // 单次扫描模板字符串，生成 token 数组
+        _tokenize: function(template) {
+            var tokens = [];
+            var pos = 0, len = template.length;
             while (pos < len) {
                 var openIdx = template.indexOf('{{', pos);
-                if (openIdx === -1) { result += template.slice(pos); break; }
-                result += template.slice(pos, openIdx);
+                if (openIdx === -1) {
+                    tokens.push({ type: 'text', value: template.slice(pos) });
+                    break;
+                }
+                if (openIdx > pos) {
+                    tokens.push({ type: 'text', value: template.slice(pos, openIdx) });
+                }
                 var closeIdx = utils._findClosingBraces(template, openIdx + 2);
-                if (closeIdx === -1) { result += template.slice(openIdx); break; }
+                if (closeIdx === -1) {
+                    tokens.push({ type: 'text', value: template.slice(openIdx) });
+                    break;
+                }
                 var tag = template.slice(openIdx + 2, closeIdx).trim();
                 pos = closeIdx + 2;
 
-                // #if
-                if (tag.indexOf('#if ') === 0 || tag === '#if') {
-                    var ifCond = tag.indexOf('#if ') === 0 ? tag.slice(4).trim() : '';
-                    var inner = utils._extractBlock(template, pos, '#if', '/if');
-                    pos = inner.nextPos;
-                    var rendered = '';
-                    if (ifCond) {
-                        var branches = utils._splitIfBranches(inner.content);
-                        for (var bi = 0; bi < branches.length; bi++) {
-                            if (branches[bi].condition === null || utils.evalCondition(branches[bi].condition, data)) {
-                                rendered = utils.parseTemplate(branches[bi].content, data, onceCache, pendingPromises);
-                                break;
-                            }
-                        }
+                // 注释
+                if (tag.indexOf('--') === 0) continue;
+
+                // 块关闭
+                if (tag.indexOf('/') === 0) {
+                    tokens.push({ type: 'block_close', name: tag.slice(1) });
+                    continue;
+                }
+
+                // 块打开
+                if (tag.indexOf('#') === 0) {
+                    var spaceIdx = tag.indexOf(' ');
+                    var blockName = spaceIdx > -1 ? tag.slice(1, spaceIdx) : tag.slice(1);
+                    var blockArg = spaceIdx > -1 ? tag.slice(spaceIdx + 1).trim() : '';
+                    if (blockName === 'else' || blockName === 'elseif') {
+                        tokens.push({ type: 'else', cond: blockArg || null });
                     } else {
-                        rendered = utils.parseTemplate(inner.content, data, onceCache, pendingPromises);
+                        tokens.push({ type: 'block_open', name: blockName, arg: blockArg });
                     }
-                    result += rendered;
                     continue;
                 }
-                // #for
-                if (tag.indexOf('#for ') === 0) {
-                    var forExpr = tag.slice(5).trim();
-                    var forMatch = forExpr.match(/^(\w+)\s+of\s+([\w.]+)(?:\s+key\s*=\s*"([^"]*)")?\s*$/);
-                    var forInner = utils._extractBlock(template, pos, '#for', '/for');
-                    pos = forInner.nextPos;
-                    if (forMatch) {
-                        var items = utils.getNested(data, forMatch[2]);
-                        var itemName = forMatch[1];
-                        var trackKey = forMatch[3] || null;
-                        if (utils.isArray(items) && items.length > 0) {
-                            for (var fi = 0; fi < items.length; fi++) {
-                                var listItem = items[fi];
-                                var ctx = {};
-                                for (var dk in data) { if (data.hasOwnProperty(dk)) ctx[dk] = data[dk]; }
-                                ctx.index = fi; ctx.parent = data; ctx[itemName] = listItem;
-                                var keyVal = '__idx_' + fi;
-                                if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
-                                ctx['@key'] = keyVal;
-                                var itemRendered = utils.parseTemplate(forInner.content, ctx, onceCache, pendingPromises);
-                                result += '<shadowit-key data-key="' + keyVal + '">' + itemRendered + '</shadowit-key>';
-                            }
+
+                // 普通插值
+                tokens.push({ type: 'expr', value: tag });
+            }
+            return tokens;
+        },
+
+        // 递归处理 token 数组，生成带标注的 HTML
+        _processTokens: function(tokens, startIdx, data, onceCache, pendingPromises) {
+            var result = '';
+            var i = startIdx;
+            while (i < tokens.length) {
+                var token = tokens[i];
+
+                if (token.type === 'text') {
+                    result += token.value;
+                    i++;
+                } else if (token.type === 'expr') {
+                    var tag = token.value;
+                    if (/^[a-zA-Z_$][\w.$]*$/.test(tag)) {
+                        var val = utils.getNested(data, tag);
+                        var esc = val !== undefined && val !== null ? utils.escapeHtml(val) : '';
+                        result += '<s-text data-path="' + utils.escapeHtml(tag) + '">' + esc + '</s-text>';
+                    } else if (/^\.\.\//.test(tag)) {
+                        var parts = tag.split('/'), levels = 0, path = '';
+                        for (var pi = 0; pi < parts.length; pi++) {
+                            if (parts[pi] === '..') levels++; else { path = parts[pi]; break; }
+                        }
+                        var parentData = utils.getParentData(data, levels);
+                        if (parentData) {
+                            var pval = utils.getNested(parentData, path);
+                            var pesc = pval !== undefined && pval !== null ? utils.escapeHtml(pval) : '';
+                            result += '<s-text data-path="' + utils.escapeHtml(tag) + '">' + pesc + '</s-text>';
                         }
                     }
-                    continue;
-                }
-                // #show
-                if (tag.indexOf('#show ') === 0) {
-                    var showExpr = tag.slice(6).trim();
-                    var showVal = utils.evalCondition(showExpr, data);
-                    var showInner = utils._extractBlock(template, pos, '#show', '/show');
-                    pos = showInner.nextPos;
-                    var showContent = utils.parseTemplate(showInner.content, data, onceCache, pendingPromises);
-                    result += showVal ? showContent : '<shadowit-key style="display:none">' + showContent + '</shadowit-key>';
-                    continue;
-                }
-                // #once
-                if (tag === '#once') {
-                    var onceKey = 'once_' + openIdx;
-                    var onceInner = utils._extractBlock(template, pos, '#once', '/once');
-                    pos = onceInner.nextPos;
-                    if (onceCache[onceKey]) { result += onceCache[onceKey]; }
-                    else {
-                        var onceRendered = utils.parseTemplate(onceInner.content, data, onceCache, pendingPromises);
-                        onceCache[onceKey] = onceRendered;
-                        result += onceRendered;
+                    i++;
+                } else if (token.type === 'block_open') {
+                    var blockName = token.name;
+                    var blockArg = token.arg;
+
+                    // 收集块内容（处理嵌套）
+                    var depth = 1;
+                    var blockTokens = [];
+                    var j = i + 1;
+                    while (j < tokens.length && depth > 0) {
+                        var tk = tokens[j];
+                        if (tk.type === 'block_open') depth++;
+                        else if (tk.type === 'block_close') {
+                            depth--;
+                            if (depth === 0) { j++; break; }
+                        }
+                        blockTokens.push(tk);
+                        j++;
                     }
-                    continue;
-                }
-                // #await
-                if (tag.indexOf('#await ') === 0) {
-                    var awaitExpr = tag.slice(7).trim();
-                    var awaitInner = utils._extractBlock(template, pos, '#await', '/await');
-                    pos = awaitInner.nextPos;
-                    var awaitParts = utils._splitAwaitBranches(awaitInner.content);
-                    var awaitVal = utils.getNested(data, awaitExpr);
-                    if (awaitVal && typeof awaitVal.then === 'function') {
-                        // 是 Promise：渲染 loading 状态，注册回调
-                        result += utils.parseTemplate(awaitParts.loading, data, onceCache, pendingPromises);
-                        if (pendingPromises) {
+                    i = j; // 跳到块结束之后
+
+                    if (blockName === 'if') {
+                        var ifCond = blockArg;
+                        var encodedTpl = utils._encodeTemplate(utils._tokensToTemplate(blockTokens));
+                        var branches = utils._splitIfBranchesTokens(blockTokens, ifCond);
+                        var rendered = '';
+                        if (ifCond) {
+                            for (var bi = 0; bi < branches.length; bi++) {
+                                if (branches[bi].condition === null || utils.evalCondition(branches[bi].condition, data)) {
+                                    rendered = utils._processTokens(branches[bi].tokens, 0, data, onceCache, pendingPromises);
+                                    break;
+                                }
+                            }
+                        } else {
+                            rendered = utils._processTokens(blockTokens, 0, data, onceCache, pendingPromises);
+                        }
+                        result += '<s-if data-cond="' + utils.escapeHtml(ifCond || '') + '" data-template="' + encodedTpl + '">' + rendered + '</s-if>';
+
+                    } else if (blockName === 'for') {
+                        var forExpr = blockArg;
+                        var forMatch = forExpr.match(/^(\w+)\s+of\s+([\w.]+)(?:\s+key\s*=\s*"([^"]*)")?\s*$/);
+                        var encodedForTpl = utils._encodeTemplate(utils._tokensToTemplate(blockTokens));
+                        if (forMatch) {
+                            var items = utils.getNested(data, forMatch[2]);
+                            var itemName = forMatch[1];
+                            var trackKey = forMatch[3] || null;
+                            var forRendered = '';
+                            if (utils.isArray(items) && items.length > 0) {
+                                for (var fi = 0; fi < items.length; fi++) {
+                                    var listItem = items[fi];
+                                    var ctx = {};
+                                    for (var dk in data) { if (data.hasOwnProperty(dk)) ctx[dk] = data[dk]; }
+                                    ctx.index = fi; ctx.parent = data; ctx[itemName] = listItem;
+                                    var keyVal = '__idx_' + fi;
+                                    if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
+                                    ctx['@key'] = keyVal;
+                                    var itemRendered = utils._processTokens(blockTokens, 0, ctx, onceCache, pendingPromises);
+                                    forRendered += '<s-k data-key="' + keyVal + '">' + itemRendered + '</s-k>';
+                                }
+                            }
+                            result += '<s-for data-expr="' + utils.escapeHtml(forExpr) + '" data-key="' + (trackKey || '') + '" data-template="' + encodedForTpl + '">' + forRendered + '</s-for>';
+                        }
+
+                    } else if (blockName === 'show') {
+                        var showExpr = blockArg;
+                        var showContent = utils._processTokens(blockTokens, 0, data, onceCache, pendingPromises);
+                        var showVal = utils.evalCondition(showExpr, data);
+                        result += '<s-show data-path="' + utils.escapeHtml(showExpr) + '"' + (showVal ? '' : ' style="display:none"') + '>' + showContent + '</s-show>';
+
+                    } else if (blockName === 'once') {
+                        var onceKey = 'once_' + (blockTokens.length > 0 ? blockTokens[0].value || '' : '') + '_' + Math.random();
+                        if (onceCache[onceKey]) {
+                            result += '<s-once>' + onceCache[onceKey] + '</s-once>';
+                        } else {
+                            var onceRendered = utils._processTokens(blockTokens, 0, data, onceCache, pendingPromises);
+                            onceCache[onceKey] = onceRendered;
+                            result += '<s-once>' + onceRendered + '</s-once>';
+                        }
+
+                    } else if (blockName === 'await') {
+                        var awaitExpr = blockArg;
+                        var awaitParts = utils._splitAwaitBranchesTokens(blockTokens);
+                        var awaitVal = utils.getNested(data, awaitExpr);
+
+                        // 检查是否为 URL 字符串：{{#await "https://..."}}
+                        var isUrl = /^["'][^"']+["']$/.test(awaitExpr);
+                        var urlExpr = awaitExpr;
+                        if (isUrl) {
+                            urlExpr = awaitExpr.slice(1, -1); // 去掉引号，得到纯 URL
+                            awaitVal = fetch(urlExpr).then(function(r) {
+                                if (!r.ok) throw new Error('HTTP ' + r.status);
+                                return r.json();
+                            });
+                        }
+
+                        var loadingContent = utils._processTokens(awaitParts.loading, 0, data, onceCache, pendingPromises);
+                        var thenCtx = {};
+                        for (var tdk in data) { if (data.hasOwnProperty(tdk)) thenCtx[tdk] = data[tdk]; }
+                        if (awaitParts.thenVar && awaitVal !== undefined && awaitVal !== null && typeof awaitVal.then !== 'function') {
+                            thenCtx[awaitParts.thenVar] = awaitVal;
+                        }
+                        var thenContent = utils._processTokens(awaitParts.then, 0, thenCtx, onceCache, pendingPromises);
+                        var catchContent = utils._processTokens(awaitParts.catch, 0, data, onceCache, pendingPromises);
+
+                        var isPromise = awaitVal && typeof awaitVal.then === 'function';
+                        var isResolved = awaitVal !== undefined && awaitVal !== null && typeof awaitVal.then !== 'function';
+
+                        result += '<s-await data-path="' + utils.escapeHtml(urlExpr) + '">';
+                        result += '<s-await-branch data-state="loading"' + (isResolved ? ' style="display:none"' : '') + '>' + loadingContent + '</s-await-branch>';
+                        result += '<s-await-branch data-state="then"' + (isResolved ? '' : ' style="display:none"') + '>' + thenContent + '</s-await-branch>';
+                        result += '<s-await-branch data-state="catch" style="display:none">' + catchContent + '</s-await-branch>';
+                        result += '</s-await>';
+
+                        if (isPromise && pendingPromises) {
                             pendingPromises.push({
                                 promise: awaitVal,
-                                thenContent: awaitParts.then,
+                                awaitExpr: urlExpr,
+                                thenTokens: awaitParts.then,
                                 thenVar: awaitParts.thenVar,
-                                catchContent: awaitParts.catch,
+                                catchTokens: awaitParts.catch,
                                 catchVar: awaitParts.catchVar
                             });
                         }
-                    } else if (awaitVal !== undefined && awaitVal !== null) {
-                        // 已解析：渲染 then 分支
-                        var thenCtx = {};
-                        for (var tdk in data) { if (data.hasOwnProperty(tdk)) thenCtx[tdk] = data[tdk]; }
-                        if (awaitParts.thenVar) thenCtx[awaitParts.thenVar] = awaitVal;
-                        result += utils.parseTemplate(awaitParts.then, thenCtx, onceCache, pendingPromises);
-                    } else {
-                        result += utils.parseTemplate(awaitParts.loading, data, onceCache, pendingPromises);
                     }
-                    continue;
-                }
-                // #portal
-                if (tag.indexOf('#portal') === 0) {
-                    var portalSelectorMatch = tag.match(/^#portal\s+selector\s*=\s*"([^"]*)"$/);
-                    var portalInner = utils._extractBlock(template, pos, '#portal', '/portal');
-                    pos = portalInner.nextPos;
-                    var portalContent = utils.parseTemplate(portalInner.content, data, onceCache, pendingPromises);
-                    if (portalSelectorMatch) {
-                        result += '<shadowit-portal data-selector="' + utils.escapeHtml(portalSelectorMatch[1]) + '">' + portalContent + '</shadowit-portal>';
-                    }
-                    continue;
-                }
-                // 普通插值
-                if (/^[a-zA-Z_$][\w.$]*$/.test(tag)) {
-                    var value = utils.getNested(data, tag);
-                    result += value !== undefined && value !== null ? utils.escapeHtml(value) : '';
-                } else if (/^\.\.\//.test(tag)) {
-                    var parts = tag.split('/'), levels = 0, path = '';
-                    for (var pi = 0; pi < parts.length; pi++) {
-                        if (parts[pi] === '..') levels++; else { path = parts[pi]; break; }
-                    }
-                    var parentData = utils.getParentData(data, levels);
-                    if (parentData) {
-                        var pval = utils.getNested(parentData, path);
-                        result += pval !== undefined && pval !== null ? utils.escapeHtml(pval) : '';
-                    }
+                } else if (token.type === 'else') {
+                    // else 在 _splitIfBranchesTokens 中处理，这里不应该到达
+                    i++;
+                } else {
+                    i++;
                 }
             }
             return result;
         },
 
-        _extractBlock: function(template, startPos, blockType, closeType) {
-            var depth = 1, pos = startPos, len = template.length;
-            var openTag = '{{#' + blockType, closeTag = '{{/' + closeType + '}}';
-            while (pos < len && depth > 0) {
-                var nextOpen = template.indexOf(openTag, pos);
-                var nextClose = template.indexOf(closeTag, pos);
-                if (nextClose === -1) return { content: template.slice(startPos), nextPos: len };
-                if (nextOpen > -1 && nextOpen < nextClose) { depth++; pos = nextOpen + openTag.length; }
-                else {
-                    depth--;
-                    if (depth === 0) return { content: template.slice(startPos, nextClose), nextPos: nextClose + closeTag.length };
-                    pos = nextClose + closeTag.length;
-                }
+        // 将 token 数组转回模板字符串（用于存储 #if/#for 原始模板）
+        _tokensToTemplate: function(tokens) {
+            var s = '';
+            for (var i = 0; i < tokens.length; i++) {
+                var t = tokens[i];
+                if (t.type === 'text') s += t.value;
+                else if (t.type === 'expr') s += '{{' + t.value + '}}';
+                else if (t.type === 'block_open') s += '{{#' + t.name + (t.arg ? ' ' + t.arg : '') + '}}';
+                else if (t.type === 'block_close') s += '{{/' + t.name + '}}';
+                else if (t.type === 'else') s += t.cond ? '{{#elseif ' + t.cond + '}}' : '{{#else}}';
             }
-            return { content: template.slice(startPos), nextPos: len };
+            return s;
         },
 
-        _splitIfBranches: function(content) {
-            var markers = [], regex = /\{\{#else\s*(?:if\s*\(?\s*([^})]+)\s*\)?)?\}\}/g, match;
-            while ((match = regex.exec(content)) !== null) {
-                markers.push({ index: match.index, endIndex: match.index + match[0].length, condition: match[1] ? match[1].trim() : null });
+        // 在 token 数组中按 #else/#elseif 分割分支
+        // initialCond: 外部 #if 的条件表达式（如 "count > 0"），用于第一个分支
+        _splitIfBranchesTokens: function(tokens, initialCond) {
+            var branches = [];
+            var current = [];
+            // 收集 else 标记及其条件
+            var elseConds = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (tokens[i].type === 'else') {
+                    branches.push({ condition: null, tokens: current });
+                    elseConds.push(tokens[i].cond || null);
+                    current = [];
+                } else {
+                    current.push(tokens[i]);
+                }
             }
-            if (markers.length === 0) return [{ condition: null, content: content }];
-            var branches = [{ condition: null, content: content.substring(0, markers[0].index) }];
-            for (var i = 0; i < markers.length; i++) {
-                var start = markers[i].endIndex;
-                var end = i < markers.length - 1 ? markers[i + 1].index : content.length;
-                branches.push({ condition: markers[i].condition, content: content.substring(start, end) });
+            branches.push({ condition: null, tokens: current });
+            // 第一个分支使用外部传入的 initialCond，后续分支取 else 标记的 cond
+            branches[0].condition = initialCond || null;
+            for (var ei = 0; ei < elseConds.length; ei++) {
+                if (ei + 1 < branches.length) {
+                    branches[ei + 1].condition = elseConds[ei];
+                }
             }
             return branches;
+        },
+
+        // 在 token 数组中按 :then/:catch/:loading 分割 #await 分支
+        _splitAwaitBranchesTokens: function(tokens) {
+            var result = { loading: [], then: [], thenVar: null, catch: [], catchVar: null };
+            var current = 'loading';
+            for (var i = 0; i < tokens.length; i++) {
+                var t = tokens[i];
+                if (t.type === 'block_open' && (t.name === 'then' || t.name === 'catch' || t.name === 'loading')) {
+                    current = t.name;
+                    if (t.name === 'then' && t.arg) result.thenVar = t.arg;
+                    if (t.name === 'catch' && t.arg) result.catchVar = t.arg;
+                    continue;
+                }
+                if (t.type === 'block_close' && (t.name === 'then' || t.name === 'catch' || t.name === 'loading')) {
+                    continue;
+                }
+                result[current].push(t);
+            }
+            return result;
+        },
+
+        // 入口：解析模板字符串，输出带标注的 HTML
+        parseTemplate: function(template, data, onceCache, pendingPromises) {
+            if (!template) return '';
+            onceCache = onceCache || {};
+            pendingPromises = pendingPromises || null;
+            template = utils.stripComments(template);
+            var tokens = utils._tokenize(template);
+            return utils._processTokens(tokens, 0, data, onceCache, pendingPromises);
         },
 
         getParentData: function(data, levels) {
@@ -360,33 +465,8 @@
             return result;
         },
 
-        // 设置嵌套属性值（用于 @bind 双向绑定回写）
-        // 路径中间若为 null/undefined 或非对象，则停止，避免覆盖数据
-        _setNested: function(obj, path, value) {
-            if (!obj || !path) return;
-            var keys = path.split('.');
-            var last = keys.pop();
-            var target = obj;
-            for (var i = 0; i < keys.length; i++) {
-                var cur = target[keys[i]];
-                if (cur === null || cur === undefined) {
-                    // 中间路径不存在，创建空对象继续
-                    target[keys[i]] = {};
-                } else if (!utils.isObject(cur)) {
-                    // 中间路径是原始值（字符串、数字等），不予覆盖，停止写入
-                    console.warn('[shadowit] @bind 路径 "' + path + '" 在 "' + keys[i] + '" 处不是对象，无法写入。');
-                    return;
-                }
-                target = target[keys[i]];
-            }
-            target[last] = value;
-        },
-
-        // 分割 #await 分支：{{:then varname}}...{{:catch varname}}...{{:loading}}...
-        // 或 {{:then}}...{{/await}}
         _splitAwaitBranches: function(content) {
             var result = { loading: '', then: '', thenVar: null, catch: '', catchVar: null };
-            // 匹配 :then、:catch、:loading 分支标记
             var branchRe = /\{\{:(then|catch|loading)(?:\s+(\w+))?\}\}/g;
             var markers = [];
             var match;
@@ -399,11 +479,9 @@
                 });
             }
             if (markers.length === 0) {
-                // 无分支标记：全部视为 loading 内容
                 result.loading = content;
                 return result;
             }
-            // 第一个 marker 之前的内容是 loading
             result.loading = content.substring(0, markers[0].index);
             for (var i = 0; i < markers.length; i++) {
                 var start = markers[i].endIndex;
@@ -427,7 +505,6 @@
             return utils.parseTemplate(template, data, onceCache, pendingPromises);
         },
 
-        // 解析事件表达式: @click="handler(arg1, arg2)"
         parseEventExpr: function(expr) {
             var match = expr.match(/^(\w+)\(([^)]*)\)$/);
             if (match) {
@@ -446,27 +523,80 @@
                 return { name: match[1], args: args };
             }
             return { name: expr, args: [] };
-        }
-    };
+        },
 
-    // ============================================================
-    // 事件委托管理器（在 _root 上统一监听，永不重建）
-    // ============================================================
-    function DelegatedEventManager(root, dataFn, methodsFn, bindCallback) {
+        };// ===== Module 3: Template Engine (compileBindings) =====
+
+    function compileBindings(rootEl) {
+        var bindings = { texts: [], shows: [], ifs: [], fors: [], awaits: [], onces: [] };
+
+        function walk(node) {
+            if (node.nodeType !== 1) return;
+            var tag = node.tagName.toLowerCase();
+
+            if (tag === 's-text') {
+                var path = node.getAttribute('data-path');
+                if (path) {
+                    bindings.texts.push({ node: node, path: path });
+                }
+            } else if (tag === 's-show') {
+                var showPath = node.getAttribute('data-path');
+                if (showPath) {
+                    bindings.shows.push({ node: node, path: showPath });
+                }
+            } else if (tag === 's-if') {
+                var cond = node.getAttribute('data-cond');
+                var tpl = node.getAttribute('data-template');
+                if (cond !== null && tpl) {
+                    // 预编译：解码 data-template 并 tokenize，避免每次更新重复扫描字符串
+                    var decodedTpl = tpl.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+                    var preTokens = utils._tokenize(decodedTpl);
+                    bindings.ifs.push({ node: node, cond: cond, template: tpl, tokens: preTokens });
+                }
+            } else if (tag === 's-for') {
+                var expr = node.getAttribute('data-expr');
+                var key = node.getAttribute('data-key') || '';
+                var ftpl = node.getAttribute('data-template');
+                if (expr && ftpl) {
+                    var decodedForTpl = ftpl.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+                    var preForTokens = utils._tokenize(decodedForTpl);
+                    bindings.fors.push({ node: node, expr: expr, key: key, template: ftpl, tokens: preForTokens });
+                }
+            } else if (tag === 's-await') {
+                var awaitPath = node.getAttribute('data-path');
+                if (awaitPath) {
+                    bindings.awaits.push({ node: node, path: awaitPath });
+                }} else if (tag === 's-once') {
+                bindings.onces.push({ node: node });
+            }
+
+            var children = node.childNodes;
+            for (var i = 0; i < children.length; i++) {
+                walk(children[i]);
+            }
+        }
+
+        walk(rootEl);
+        return bindings;
+    }
+
+    // ===== Module 4: EventDelegator =====
+
+    var ALLOWED_EVENTS = { click: 1, input: 1, change: 1, mouseover: 1, mouseout: 1, submit: 1, focus: 1, blur: 1, keydown: 1, keyup: 1 };
+
+    function DelegatedEventManager(root, dataFn, methodsFn, shadowItInstance) {
         this._root = root;
         this._dataFn = dataFn;
         this._methodsFn = methodsFn;
-        this._bindCallback = bindCallback || null;
-        this._listeners = {};   // { eventType: boundFn }
-        this._handlers = {};    // { eventType: [{ selector, handlerName, parsedArgs }] }
-        this._boundNodes = new WeakSet();  // 增量绑定：标记已扫描节点
-        this._bindings = [];    // @bind 绑定列表
+        this._listeners = {};
+        this._handlers = {};
+        this._boundNodes = new WeakSet();
+        this._shadowItInstance = shadowItInstance || null;
     }
 
     DelegatedEventManager.prototype.scan = function(newNodes) {
         if (!this._root) return this;
 
-        // 保留已存在元素的处理器（它们已移除 @click 属性，但 __sdit_events 标记仍在）
         var newHandlers = {};
         for (var et in this._handlers) {
             if (this._handlers.hasOwnProperty(et)) {
@@ -481,27 +611,15 @@
             }
         }
 
-        // 保留仍然连接的 @bind 绑定
-        var newBindings = [];
-        var self = this;
-        for (var bi = 0; bi < this._bindings.length; bi++) {
-            if (this._bindings[bi].el && this._bindings[bi].el.isConnected) {
-                newBindings.push(this._bindings[bi]);
-            }
-        }
-
-        // 增量扫描：如果有 newNodes，只扫描新节点；否则全量扫描
         var nodesToScan;
         if (newNodes && newNodes.length > 0) {
             nodesToScan = newNodes;
         } else {
-            // 全量扫描（首次渲染）
             nodesToScan = this._root.querySelectorAll('*');
         }
 
         for (var i = 0; i < nodesToScan.length; i++) {
             var el = nodesToScan[i];
-            // WeakSet 去重：已扫描过的节点跳过
             if (this._boundNodes.has(el)) continue;
             this._boundNodes.add(el);
 
@@ -512,38 +630,11 @@
                     var attrValue = el.getAttribute(name);
                     el.removeAttribute(name);
 
-                    // @bind 双向绑定：特殊处理
-                    if (name === '@bind' && attrValue && this._bindCallback) {
-                        if (!el.__sdit_events) el.__sdit_events = {};
-                        el.__sdit_events['__bind__'] = true;
-                        var bindPath = attrValue;
-                        // 设置初始值
-                        var data = this._dataFn ? this._dataFn() : {};
-                        var initVal = utils.getNested(data, bindPath);
-                        if (initVal !== undefined && initVal !== null) {
-                            if (el.type === 'checkbox') {
-                                el.checked = !!initVal;
-                            } else {
-                                el.value = String(initVal);
-                            }
-                        }
-                        var bindHandler = (function(path, elem) {
-                            return function(e) {
-                                var val;
-                                if (elem.type === 'checkbox') val = elem.checked;
-                                else val = elem.value;
-                                self._bindCallback(path, val);
-                            };
-                        })(bindPath, el);
-                        el.addEventListener('input', bindHandler);
-                        el.addEventListener('change', bindHandler);
-                        newBindings.push({ el: el, path: bindPath, handler: bindHandler });
-                        continue;
-                    }
-
-                    // 普通事件委托 @click, @submit 等
                     if (attrValue) {
                         var eventType = name.slice(1);
+                        // 事件白名单检查
+                        if (!ALLOWED_EVENTS[eventType]) continue;
+
                         if (!newHandlers[eventType]) newHandlers[eventType] = [];
                         if (!el.__sdit_events) el.__sdit_events = {};
                         if (el.__sdit_events[eventType]) continue;
@@ -559,21 +650,18 @@
             }
         }
         this._handlers = newHandlers;
-        this._bindings = newBindings;
         this._ensureListeners();
         return this;
     };
 
     DelegatedEventManager.prototype._ensureListeners = function() {
         var self = this;
-        // 移除不再需要的监听器
         for (var et in this._listeners) {
             if (this._listeners.hasOwnProperty(et) && !this._handlers[et]) {
                 this._root.removeEventListener(et, this._listeners[et]);
                 delete this._listeners[et];
             }
         }
-        // 添加新的监听器
         for (var eventType in this._handlers) {
             if (this._handlers.hasOwnProperty(eventType) && !this._listeners[eventType]) {
                 var boundFn = (function(et) {
@@ -617,6 +705,10 @@
             }
         }
         fn.apply(el, [e, el].concat(resolvedArgs));
+        // 微响应式：事件处理后自动更新视图
+        if (this._shadowItInstance && !this._shadowItInstance._destroyed) {
+            this._shadowItInstance.update();
+        }
     };
 
     DelegatedEventManager.prototype.destroy = function() {
@@ -625,23 +717,13 @@
                 this._root.removeEventListener(et, this._listeners[et]);
             }
         }
-        // 清理 @bind 绑定
-        for (var i = 0; i < this._bindings.length; i++) {
-            var b = this._bindings[i];
-            if (b.el && b.handler) {
-                b.el.removeEventListener('input', b.handler);
-                b.el.removeEventListener('change', b.handler);
-            }
-        }
         this._listeners = {};
         this._handlers = {};
-        this._bindings = [];
         this._root = null;
     };
 
-    // ============================================================
-    // ShadowIt 核心类
-    // ============================================================
+    // ===== Module 5: ShadowIt Core =====
+
     function ShadowIt(host, options) {
         if (!isSupported()) {
             console.warn('[shadowit] 当前浏览器不支持 Shadow DOM 或 Custom Elements，请加载 polyfill。');
@@ -649,22 +731,37 @@
         options = options || {};
         var cssVal = options.css || options.styles || '';
 
+        // 调用 setup() 获取扁平对象：函数 → methods，非函数 → data，computed 特殊提取
+        var setupResult = utils.isFunction(options.setup) ? options.setup() : {};
+        var setupData = {};
+        var setupMethods = {};
+        var setupComputed = {};
+        for (var sk in setupResult) {
+            if (setupResult.hasOwnProperty(sk)) {
+                if (sk === 'computed' && utils.isObject(setupResult[sk])) {
+                    setupComputed = setupResult[sk];
+                } else if (utils.isFunction(setupResult[sk])) {
+                    setupMethods[sk] = setupResult[sk];
+                } else {
+                    setupData[sk] = setupResult[sk];
+                }
+            }
+        }
+
         this.options = {
             template: options.template || '',
             css: cssVal,
-            data: options.data || {},
             mode: options.mode || 'open',
-            lifecycle: options.lifecycle || {},
             onError: options.onError || null,
             eventsOnHost: options.eventsOnHost || false,
-            name: options.name || null,
-            methods: options.methods || {},
-            computed: options.computed || {},
-            reactive: options.reactive !== false  // 默认开启 Proxy 响应式
+            name: options.name || null
         };
 
         this._id = utils.uid();
-        this._data = utils.deepClone(this.options.data);
+        this._data = utils.deepClone(setupData);
+        this._methods = setupMethods;
+        this._computed = setupComputed;
+        
         this._rendered = false;
         this._destroyed = false;
         this._mounted = false;
@@ -672,22 +769,25 @@
         this._queryCache = new Map();
         this._onceCache = {};
         this._updating = false;
-        this._updateScheduled = false;   // requestAnimationFrame 批处理标记
-        this._pendingPromises = [];       // #await 待处理 Promise
+        this._updateScheduled = false;
+        this._pendingPromises = [];
+        this._bindings = null;
+        
 
         this._host = null;
         this._root = null;
         this._lastHtml = '';
         this._delegatedEvents = null;
-        this._groupInstances = [];  // 多宿主组实例（sdit([...]) 时追踪）
+        this._groupInstances = [];
 
-        this._lifecycle = {
-            beforeRender: this.options.lifecycle.beforeRender || null,
-            afterRender: this.options.lifecycle.afterRender || null,
-            beforeUpdate: this.options.lifecycle.beforeUpdate || null,
-            afterUpdate: this.options.lifecycle.afterUpdate || null,
-            shouldUpdate: this.options.lifecycle.shouldUpdate || null,
-            destroy: this.options.lifecycle.destroy || null
+        // lifecycle hooks 提升为顶层选项
+        this._hooks = {
+            beforeRender: options.beforeRender || null,
+            afterRender: options.afterRender || null,
+            beforeUpdate: options.beforeUpdate || null,
+            afterUpdate: options.afterUpdate || null,
+            shouldUpdate: options.shouldUpdate || null,
+            destroy: options.destroy || null
         };
 
         this._name = this.options.name;
@@ -701,7 +801,7 @@
         if (host) { this.mount(host); }
     }
 
-    ShadowIt._rootSeed = 0;
+    ShadowIt._rootSeed = 0;// ----- Mount -----
 
     ShadowIt.prototype._mountOne = function(hostEl) {
         if (!hostEl) throw new Error('[shadowit] 宿主元素未找到');
@@ -710,7 +810,6 @@
         this._mounted = true;
         shadowit._instances.set(this._host, this);
 
-        // 自动 template：如果 template 为空，取宿主子元素作为模板
         var tpl = this.options.template;
         if (!tpl || (utils.isString(tpl) && tpl.trim() === '')) {
             var hostHTML = this._host.innerHTML;
@@ -725,16 +824,9 @@
         this._delegatedEvents = new DelegatedEventManager(
             eventRoot,
             function() { return self._data; },
-            function() { return self.options.methods; },
-            function(path, value) {
-                utils._setNested(self._data, path, value);
-                self.update();
-            }
+            function() { return self._methods; },
+            self
         );
-
-        if (this.options.reactive && typeof Proxy !== 'undefined') {
-            this._makeReactive();
-        }
 
         this._applyCSS();
         this.render();
@@ -744,31 +836,37 @@
     ShadowIt.prototype.mount = function(host) {
         if (this._destroyed) throw new Error('[shadowit] 实例已销毁，无法挂载');
 
-        // 支持数组：sdit(...).mount([el1, el2, ...])
         if (utils.isArray(host) || (host && typeof host.length === 'number' && host.item)) {
             var hosts = shadowit._resolveHosts(host);
             if (hosts.length === 0) throw new Error('[shadowit] mount() 未找到任何有效宿主元素');
-            // 第一个宿主用当前实例挂载
             var firstHost = hosts[0];
             if (this._mounted) {
-                // 已有旧宿主，先 detach
                 this._detachFromHost();
             }
             this._mountOne(firstHost);
-            // 剩余宿主创建新实例并加入组（共享当前 template/css/data）
             if (!this._groupInstances) this._groupInstances = [];
             for (var i = 1; i < hosts.length; i++) {
+                var self = this;
                 var clone = new ShadowIt(hosts[i], {
                     template: this.options.template,
                     css: this.options.css,
-                    data: utils.deepClone(this._data),
+                    setup: function() {
+                        var flat = {};
+                        var cloned = utils.deepClone(self._data);
+                        for (var dk in cloned) { if (cloned.hasOwnProperty(dk)) flat[dk] = cloned[dk]; }
+                        for (var mk in self._methods) { if (self._methods.hasOwnProperty(mk)) flat[mk] = self._methods[mk]; }
+                        flat.computed = self._computed;
+                        return flat;
+                    },
                     mode: this.options.mode,
-                    lifecycle: this.options.lifecycle,
                     onError: this.options.onError,
                     eventsOnHost: this.options.eventsOnHost,
-                    methods: this.options.methods,
-                    computed: this.options.computed,
-                    reactive: this.options.reactive
+                    beforeRender: this._hooks.beforeRender,
+                    afterRender: this._hooks.afterRender,
+                    beforeUpdate: this._hooks.beforeUpdate,
+                    afterUpdate: this._hooks.afterUpdate,
+                    shouldUpdate: this._hooks.shouldUpdate,
+                    destroy: this._hooks.destroy
                 });
                 this._groupInstances.push(clone);
             }
@@ -777,12 +875,10 @@
 
         if (!host) throw new Error('[shadowit] mount() 需要指定宿主元素');
 
-        // 单个 host，支持选择器字符串
         var hostEl = utils.isString(host) ? document.querySelector(host) : host;
         if (!hostEl) throw new Error('[shadowit] 宿主元素未找到: ' + host);
 
         if (this._mounted) {
-            // 重复挂载：先 detach 旧宿主
             this._detachFromHost();
         }
 
@@ -790,7 +886,6 @@
         return this;
     };
 
-    // 从旧宿主 detach（保留数据和配置，不销毁实例）
     ShadowIt.prototype._detachFromHost = function() {
         if (this._delegatedEvents) { this._delegatedEvents.destroy(); this._delegatedEvents = null; }
         if (this._root) { this._root.innerHTML = ''; this._root = null; }
@@ -801,12 +896,11 @@
         this._queryCache.clear();
         this._onceCache = {};
         this._updateScheduled = false;
+        this._bindings = null;
     };
 
-    // 卸载实例（与 mount 相反，保留数据和配置，可重新挂载）
     ShadowIt.prototype.unmount = function() {
         if (this._destroyed) return this;
-        // 先卸载组内所有实例
         if (this._groupInstances && this._groupInstances.length > 0) {
             for (var i = 0; i < this._groupInstances.length; i++) {
                 if (this._groupInstances[i] && !this._groupInstances[i]._destroyed) {
@@ -820,6 +914,7 @@
     };
 
     // ----- 配置方法 -----
+
     ShadowIt.prototype.template = function(html) {
         if (this._destroyed) return this;
         this.options.template = html;
@@ -837,25 +932,28 @@
 
     ShadowIt.prototype.data = function(newData) {
         if (this._destroyed) return this;
-        if (utils.isObject(newData)) utils.merge(this._data, newData);
-        return this;
-    };
-
-    ShadowIt.prototype.setData = function(newData) {
-        if (this._destroyed) return this;
         if (utils.isObject(newData)) {
-            this._data = utils.deepClone(newData);
-            // 重新包装 Proxy（如果响应式已启用）
-            if (this.options.reactive && typeof Proxy !== 'undefined') {
-                this._makeReactive();
+            for (var key in newData) {
+                if (!newData.hasOwnProperty(key)) continue;
+                this._data[key] = newData[key];
             }
         }
         return this;
     };
 
-    ShadowIt.prototype.getData = function() { return utils.deepClone(this._data); };
+    ShadowIt.prototype.setData = function(newData) {
+        if (this._destroyed) return this;
+        if (utils.isObject(newData)) {this._data = utils.deepClone(newData);
+        }
+        return this;
+    };
+
+    ShadowIt.prototype.getData = function() {
+        return utils.deepClone(this._data);
+    };
 
     // ----- 渲染与更新 -----
+
     ShadowIt.prototype._renderToHtml = function() {
         var html = this.options.template || '';
         if (utils.isFunction(html)) html = html(this._data);
@@ -875,11 +973,21 @@
             return this;
         }
         if (this._updating) {
-            if (utils.isObject(newData)) utils.merge(this._data, newData);
+            if (utils.isObject(newData)) {
+                for (var key in newData) {
+                    if (!newData.hasOwnProperty(key)) continue;
+                    this._data[key] = newData[key];
+                }
+            }
             return this;
         }
         if (!this._mounted) {
-            if (utils.isObject(newData)) utils.merge(this._data, newData);
+            if (utils.isObject(newData)) {
+                for (var dk in newData) {
+                    if (!newData.hasOwnProperty(dk)) continue;
+                    this._data[dk] = newData[dk];
+                }
+            }
             return this;
         }
 
@@ -894,49 +1002,49 @@
                 this._callHook('beforeUpdate', newData, oldData);
             }
 
-            if (utils.isObject(newData)) utils.merge(this._data, newData);
+            if (utils.isObject(newData)) {
+                for (var ndk in newData) {
+                    if (!newData.hasOwnProperty(ndk)) continue;
+                    this._data[ndk] = newData[ndk];
+                }
+            }
 
-            // shouldUpdate 钩子：数据合并后调用，允许开发者根据最终状态判断是否跳过渲染
-            if (!isFirstRender && utils.isFunction(this._lifecycle.shouldUpdate)) {
-                if (!this._lifecycle.shouldUpdate.call(this, newData, this._data)) {
+            if (!isFirstRender && utils.isFunction(this._hooks.shouldUpdate)) {
+                if (!this._hooks.shouldUpdate.call(this, newData, this._data)) {
                     this._updating = false;
                     return this;
                 }
             }
 
-            // 计算 computed 属性
             this._evalComputed();
 
-            // 收集 #await 待处理的 Promise
-            this._pendingPromises = [];
-            var html = this._renderToHtml();
-            if (html === this._lastHtml && !isFirstRender && this._pendingPromises.length === 0) {
-                this._updating = false;
-                return this;
-            }
-
-            var newNodes = [];
             if (isFirstRender) {
+                // 首次渲染：全量 HTML 生成 + 编译绑定
+                this._pendingPromises = [];
+                var html = this._renderToHtml();
                 this._root.innerHTML = html;
+                this._rendered = true;
+                this._lastHtml = html;
+
+                this._bindings = compileBindings(this._root);
+                this._delegatedEvents.scan();
+                this._queryCache.clear();
+                if (shadowit._cacheEnabled) shadowit.clearQueryCache();
+                this._resolvePendingPromises();
+
+                this._callHook('afterRender', this._data);
             } else {
-                newNodes = this._keyedDiff(this._root, html);
+                // 后续更新：使用绑定系统直接操作 DOM
+                var structuralChange = this._applyBindings(this._bindings);
+
+                // 仅在 DOM 结构变化时（#if/#for 重渲染）清除查询缓存
+                if (structuralChange) {
+                    this._queryCache.clear();
+                    if (shadowit._cacheEnabled) shadowit.clearQueryCache();
+                }
+
+                this._callHook('afterUpdate', newData, this._data);
             }
-            this._rendered = true;
-            this._lastHtml = html;
-
-            // 增量事件绑定：仅扫描新节点
-            this._delegatedEvents.scan(newNodes.length > 0 ? newNodes : null);
-            this._queryCache.clear();
-            if (shadowit._cacheEnabled) shadowit.clearQueryCache();
-
-            // 处理 #portal 传送门
-            this._handlePortals();
-
-            // 处理 #await Promise 回调
-            this._resolvePendingPromises();
-
-            if (isFirstRender) this._callHook('afterRender', this._data);
-            else this._callHook('afterUpdate', newData, this._data);
         } catch (err) {
             this._handleError(err, isFirstRender ? 'render' : 'update');
         }
@@ -944,197 +1052,186 @@
         return this;
     };
 
-    // ============================================================
-    // Keyed Diff — 两阶段键控 Diff + 位置移动检测
-    // 阶段一：处理 keyed 节点（移除/复用/移动）
-    // 阶段二：处理非 keyed 段落（标签感知 diff）
-    // ============================================================
-    ShadowIt.prototype._keyedDiff = function(parent, newHtml) {
-        var temp = document.createElement('div');
-        temp.innerHTML = newHtml;
+    // ----- 绑定应用（直接 DOM 操作，跳过字符串解析） -----
+    // 返回 true 表示发生了结构性 DOM 变化（#if/#for 重渲染）
 
-        var oldChildren = Array.from(parent.childNodes);
-        var newChildren = Array.from(temp.childNodes);
-        var oldLen = oldChildren.length, newLen = newChildren.length;
-        var newNodes = [];  // 收集新增节点，供增量事件绑定使用
+    ShadowIt.prototype._applyBindings = function(bindings) {
+        if (!bindings) return false;
+        var data = this._data;
+        var self = this;
+        var structuralChange = false;
 
-        // ---- 收集旧的 keyed 节点 ----
-        var oldKeyMap = new Map();   // key -> node
-        var oldKeyList = [];          // [{ key, node, index }]
-        for (var oi = 0; oi < oldLen; oi++) {
-            var oc = oldChildren[oi];
-            if (oc.nodeType === 1 && oc.tagName === 'SHADOWIT-KEY') {
-                var key = oc.getAttribute('data-key');
-                oldKeyMap.set(key, oc);
-                oldKeyList.push({ key: key, node: oc, index: oi });
+        
+
+        // texts: 直接设置 textContent
+        for (var i = 0; i < bindings.texts.length; i++) {
+            var t = bindings.texts[i];
+            if (!t.node || !t.node.isConnected) continue;
+            var val = utils.getNested(data, t.path);
+            var text = val !== undefined && val !== null ? String(val) : '';
+            if (t.node.textContent !== text) {
+                t.node.textContent = text;
             }
         }
 
-        // ---- 收集新的 keyed 节点 ----
-        var newKeySpecs = [];         // [{ key, node, index }]
-        var newKeyMap = new Map();    // key -> spec
-        for (var ni = 0; ni < newLen; ni++) {
-            var nc = newChildren[ni];
-            if (nc.nodeType === 1 && nc.tagName === 'SHADOWIT-KEY') {
-                var spec = { key: nc.getAttribute('data-key'), node: nc, index: ni };
-                newKeySpecs.push(spec);
-                newKeyMap.set(spec.key, spec);
-            }
+        // shows: 直接设置 display
+        for (var i = 0; i < bindings.shows.length; i++) {
+            var s = bindings.shows[i];
+            if (!s.node || !s.node.isConnected) continue;
+            var visible = utils.evalCondition(s.path, data);
+            s.node.style.display = visible ? '' : 'none';
         }
 
-        // ---- 分治：有 keyed 节点的情况 ----
-        if (newKeySpecs.length > 0 || oldKeyList.length > 0) {
-            // 阶段一：移除旧的不再需要的 keyed 节点
-            for (var oki = 0; oki < oldKeyList.length; oki++) {
-                if (!newKeyMap.has(oldKeyList[oki].key)) {
-                    parent.removeChild(oldKeyList[oki].node);
+        // ifs: 重新渲染条件块（结构性变化）
+        for (var i = 0; i < bindings.ifs.length; i++) {
+            var ib = bindings.ifs[i];
+            if (!ib.node || !ib.node.isConnected) continue;
+            var newRendered = self._renderIfBlock(ib.cond, ib.tokens, data);
+            if (ib.node.innerHTML !== newRendered) {
+                ib.node.innerHTML = newRendered;
+                structuralChange = true;
+                // innerHTML 替换后重扫事件绑定
+                if (self._delegatedEvents) {
+                    var ifNodes = ib.node.querySelectorAll('*');
+                    var ifNodesArr = [];
+                    for (var ifni = 0; ifni < ifNodes.length; ifni++) ifNodesArr.push(ifNodes[ifni]);
+                    self._delegatedEvents.scan(ifNodesArr);
                 }
             }
-
-            // 阶段一续：按新顺序构建最终子节点列表
-            var newChildList = [];
-
-            for (var nni = 0; nni < newLen; nni++) {
-                var nchild = newChildren[nni];
-                if (nchild.nodeType === 1 && nchild.tagName === 'SHADOWIT-KEY') {
-                    var nkey = nchild.getAttribute('data-key');
-                    var oldNode = oldKeyMap.get(nkey);
-                    if (oldNode) {
-                        var oldInner = oldNode.innerHTML;
-                        var newInner = nchild.innerHTML;
-                        if (oldInner !== newInner) {
-                            oldNode.innerHTML = newInner;
-                            // 收集新插入的子节点（innerHTML 更新产生的）
-                            var innerChildren = oldNode.querySelectorAll('*');
-                            for (var ici = 0; ici < innerChildren.length; ici++) {
-                                newNodes.push(innerChildren[ici]);
-                            }
-                        }
-                        newChildList.push(oldNode);
-                    } else {
-                        // 新 key，创建
-                        var cloned = nchild.cloneNode(true);
-                        newChildList.push(cloned);
-                        // 收集新节点及其子树
-                        newNodes.push(cloned);
-                        var subNodes = cloned.querySelectorAll('*');
-                        for (var sni = 0; sni < subNodes.length; sni++) {
-                            newNodes.push(subNodes[sni]);
-                        }
-                    }
-                } else {
-                    // 非 keyed 节点：尝试从旧子节点中找对应位置复用
-                    var cloned2 = nchild.cloneNode(true);
-                    newChildList.push(cloned2);
-                    newNodes.push(cloned2);
-                    var subNodes2 = cloned2.querySelectorAll('*');
-                    for (var sn2 = 0; sn2 < subNodes2.length; sn2++) {
-                        newNodes.push(subNodes2[sn2]);
-                    }
-                }
-            }
-
-            // 清空并重建
-            while (parent.firstChild) { parent.removeChild(parent.firstChild); }
-            for (var li = 0; li < newChildList.length; li++) {
-                parent.appendChild(newChildList[li]);
-            }
-        } else {
-            // ---- 无 keyed 节点：标签感知 diff ----
-            this._diffChildren(parent, oldChildren, newChildren, newNodes);
         }
-        return newNodes;
+
+        // fors: 键控 diff 重新渲染（结构性变化）
+        for (var i = 0; i < bindings.fors.length; i++) {
+            var fb = bindings.fors[i];
+            if (!fb.node || !fb.node.isConnected) continue;
+            // #for 的数据路径从 expr 中提取
+            self._renderForBlock(fb, data);
+            structuralChange = true;
+        }
+
+        return structuralChange;
     };
 
-    // ============================================================
-    // 递归子节点 Diff — 保留 DOM 节点状态（input 焦点、video 进度等）
-    // ============================================================
-    ShadowIt.prototype._diffChildren = function(parent, oldChildren, newChildren, newNodes) {
-        var oldLen = oldChildren.length, newLen = newChildren.length;
-        var oIdx = 0, nIdx = 0;
-        while (oIdx < oldLen && nIdx < newLen) {
-            var oc = oldChildren[oIdx], nc = newChildren[nIdx];
-            if (oc.nodeType === nc.nodeType && oc.nodeName === nc.nodeName) {
-                if (oc.nodeType === 3) {
-                    // 文本节点：直接更新内容
-                    if (oc.textContent !== nc.textContent) oc.textContent = nc.textContent;
-                } else if (oc.nodeType === 1) {
-                    // 元素节点：浅层属性 diff
-                    var oldAttrs = oc.attributes, newAttrs = nc.attributes;
-                    for (var ai = oldAttrs.length - 1; ai >= 0; ai--) {
-                        if (!nc.hasAttribute(oldAttrs[ai].name)) {
-                            oc.removeAttribute(oldAttrs[ai].name);
-                        }
-                    }
-                    for (var bi = 0; bi < newAttrs.length; bi++) {
-                        var attrName = newAttrs[bi].name;
-                        // 跳过事件绑定语法（@click 等），由事件委托系统处理
-                        if (attrName.charAt(0) === '@') continue;
-                        if (oc.getAttribute(attrName) !== newAttrs[bi].value) {
-                            oc.setAttribute(attrName, newAttrs[bi].value);
-                        }
-                    }
-                    // 递归 diff 子节点，而不是 innerHTML 替换
-                    var oldChildNodes = Array.from(oc.childNodes);
-                    var newChildNodes = Array.from(nc.childNodes);
-                    this._diffChildren(oc, oldChildNodes, newChildNodes, newNodes);
+    // 渲染 #if 块（使用预编译的 token 数组，避免每次更新重新扫描字符串）
+    ShadowIt.prototype._renderIfBlock = function(cond, tokens, data) {
+        if (!tokens || tokens.length === 0) return '';
+        if (cond) {
+            var branches = utils._splitIfBranchesTokens(tokens, cond);
+            for (var bi = 0; bi < branches.length; bi++) {
+                if (branches[bi].condition === null || utils.evalCondition(branches[bi].condition, data)) {
+                    return utils._processTokens(branches[bi].tokens, 0, data, this._onceCache, null);
                 }
-                oIdx++; nIdx++;
-            } else {
-                // 向前搜索匹配标签（搜索全局而非仅 6 个）
-                var matchIdx = -1;
-                for (var si = oIdx + 1; si < oldLen; si++) {
-                    if (oldChildren[si].nodeType === nc.nodeType && oldChildren[si].nodeName === nc.nodeName) {
-                        matchIdx = si; break;
-                    }
-                }
-                if (matchIdx > -1) {
-                    // 移除中间不匹配的节点
-                    for (var ri = oIdx; ri < matchIdx; ri++) {
-                        parent.removeChild(oldChildren[ri]);
-                    }
-                    parent.insertBefore(oldChildren[matchIdx], oc || null);
-                    // 递归 diff 匹配到的节点
-                    if (oldChildren[matchIdx].nodeType === 1) {
-                        var oldSub = Array.from(oldChildren[matchIdx].childNodes);
-                        var newSub = Array.from(nc.childNodes);
-                        this._diffChildren(oldChildren[matchIdx], oldSub, newSub, newNodes);
-                    } else if (oldChildren[matchIdx].nodeType === 3 &&
-                               oldChildren[matchIdx].textContent !== nc.textContent) {
-                        oldChildren[matchIdx].textContent = nc.textContent;
-                    }
-                    oIdx = matchIdx + 1; nIdx++;
-                } else {
-                    // 找不到匹配，插入新节点
-                    var cloned = nc.cloneNode(true);
-                    parent.insertBefore(cloned, oc);
-                    parent.removeChild(oc);
-                    newNodes.push(cloned);
-                    var subNodes = cloned.querySelectorAll('*');
-                    for (var sn = 0; sn < subNodes.length; sn++) {
-                        newNodes.push(subNodes[sn]);
-                    }
-                    oIdx++; nIdx++;
+            }
+            return '';
+        }
+        return utils._processTokens(tokens, 0, data, this._onceCache, null);
+    };
+
+    // 渲染 #for 块（轻量级键控 diff，使用预编译 token 数组）
+    ShadowIt.prototype._renderForBlock = function(fb, data) {
+        var forExpr = fb.expr;
+        var forMatch = forExpr.match(/^(\w+)\s+of\s+([\w.]+)$/);
+        if (!forMatch) return;
+
+        var itemName = forMatch[1];
+        var itemsPath = forMatch[2];
+        var trackKey = fb.key || null;
+        var items = utils.getNested(data, itemsPath);
+        if (!utils.isArray(items)) items = [];
+
+        var tokens = fb.tokens;
+        var oldKeyedChildren = [];
+        var oldChildren = Array.from(fb.node.childNodes);
+        for (var oi = 0; oi < oldChildren.length; oi++) {
+            var oc = oldChildren[oi];
+            if (oc.nodeType === 1 && oc.tagName === 'S-K') {
+                oldKeyedChildren.push({ key: oc.getAttribute('data-key'), node: oc });
+            }
+        }
+
+        var newKeyedChildren = [];
+        var newHtmlParts = [];
+        for (var fi = 0; fi < items.length; fi++) {
+            var listItem = items[fi];
+            var ctx = {};
+            for (var dk in data) { if (data.hasOwnProperty(dk)) ctx[dk] = data[dk]; }
+            ctx.index = fi; ctx.parent = data; ctx[itemName] = listItem;
+            var keyVal = '__idx_' + fi;
+            if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
+            ctx['@key'] = keyVal;
+            var itemRendered = utils._processTokens(tokens, 0, ctx, this._onceCache, null);
+            newKeyedChildren.push({ key: keyVal, html: itemRendered });
+            newHtmlParts.push('<s-k data-key="' + keyVal + '">' + itemRendered + '</s-k>');
+        }
+
+        // 轻量级键控 diff
+        var oldKeyMap = {};
+        for (var oki = 0; oki < oldKeyedChildren.length; oki++) {
+            oldKeyMap[oldKeyedChildren[oki].key] = oldKeyedChildren[oki].node;
+        }
+
+        var newKeyMap = {};
+        for (var nki = 0; nki < newKeyedChildren.length; nki++) {
+            newKeyMap[newKeyedChildren[nki].key] = true;
+        }
+
+        // 移除旧的不再需要的 keyed 节点
+        for (var rki = 0; rki < oldKeyedChildren.length; rki++) {
+            if (!newKeyMap[oldKeyedChildren[rki].key]) {
+                if (oldKeyedChildren[rki].node.parentNode) {
+                    oldKeyedChildren[rki].node.parentNode.removeChild(oldKeyedChildren[rki].node);
                 }
             }
         }
-        // 移除多余的旧节点
-        while (oIdx < oldLen) { parent.removeChild(oldChildren[oIdx]); oIdx++; }
-        // 追加新节点
-        while (nIdx < newLen) {
-            var cloned4 = newChildren[nIdx].cloneNode(true);
-            parent.appendChild(cloned4);
-            newNodes.push(cloned4);
-            var subN4 = cloned4.querySelectorAll('*');
-            for (var sn4 = 0; sn4 < subN4.length; sn4++) newNodes.push(subN4[sn4]);
-            nIdx++;
+
+        // 重建子节点列表，收集新节点用于事件重扫
+        var newChildList = [];
+        var newNodes = [];
+        for (var nci = 0; nci < newKeyedChildren.length; nci++) {
+            var nk = newKeyedChildren[nci].key;
+            var oldNode = oldKeyMap[nk];
+            if (oldNode) {
+                if (oldNode.innerHTML !== newKeyedChildren[nci].html) {
+                    oldNode.innerHTML = newKeyedChildren[nci].html;
+                    // innerHTML 重建后，收集子节点及根节点用于事件重扫
+                    var innerNodes = oldNode.querySelectorAll('*');
+                    for (var ini = 0; ini < innerNodes.length; ini++) {
+                        newNodes.push(innerNodes[ini]);
+                    }
+                    newNodes.push(oldNode);  // 根节点本身也可能带有 @click 等事件属性
+                }
+                newChildList.push(oldNode);
+            } else {
+                var tempDiv = document.createElement('div');
+                tempDiv.innerHTML = newHtmlParts[nci];
+                var cloned = tempDiv.firstChild;
+                newChildList.push(cloned);
+                // 收集新节点及其子树用于事件重扫
+                newNodes.push(cloned);
+                var subNodes = cloned.querySelectorAll('*');
+                for (var sni = 0; sni < subNodes.length; sni++) {
+                    newNodes.push(subNodes[sni]);
+                }
+            }
+        }
+
+        // 清空并重建
+        while (fb.node.firstChild) { fb.node.removeChild(fb.node.firstChild); }
+        for (var li = 0; li < newChildList.length; li++) {
+            fb.node.appendChild(newChildList[li]);
+        }
+
+        // 重建后重新扫描事件绑定（防止 innerHTML 替换丢失 __sdit_events 标记）
+        if (newNodes.length > 0 && this._delegatedEvents) {
+            this._delegatedEvents.scan(newNodes);
         }
     };
 
     // ----- 生命周期 -----
+
     ShadowIt.prototype._callHook = function(name) {
         var args = Array.prototype.slice.call(arguments, 1);
-        var hook = this._lifecycle[name];
+        var hook = this._hooks[name];
         if (utils.isFunction(hook)) {
             try { hook.apply(this, args); }
             catch (err) { this._handleError(err, 'lifecycle.' + name); }
@@ -1142,8 +1239,9 @@
     };
 
     // ----- computed 计算属性 -----
+
     ShadowIt.prototype._evalComputed = function() {
-        var computed = this.options.computed;
+        var computed = this._computed;
         if (!utils.isObject(computed)) return;
         for (var key in computed) {
             if (computed.hasOwnProperty(key)) {
@@ -1156,36 +1254,8 @@
         }
     };
 
-    // ----- #portal 传送门处理 -----
-    ShadowIt.prototype._handlePortals = function() {
-        if (!this._root) return;
-        var portals = this._root.querySelectorAll('shadowit-portal');
-        if (portals.length === 0) return;
-        // 初始化 portal 节点追踪数组
-        if (!this._portalNodes) this._portalNodes = [];
-        for (var i = 0; i < portals.length; i++) {
-            var portal = portals[i];
-            var selector = portal.getAttribute('data-selector');
-            if (!selector) continue;
-            try {
-                var target = document.querySelector(selector);
-                if (target) {
-                    // 将 portal 内容移动到目标节点，并追踪
-                    while (portal.firstChild) {
-                        var child = portal.firstChild;
-                        target.appendChild(child);
-                        this._portalNodes.push(child);
-                    }
-                    // 移除空的 portal 占位符
-                    if (portal.parentNode) portal.parentNode.removeChild(portal);
-                }
-            } catch (err) {
-                this._handleError(err, 'portal: ' + selector);
-            }
-        }
-    };
+    // ----- #await Promise 处理（CSS Display Toggle） -----
 
-    // ----- #await Promise 处理 -----
     ShadowIt.prototype._resolvePendingPromises = function() {
         if (!this._pendingPromises || this._pendingPromises.length === 0) return;
         var self = this;
@@ -1193,96 +1263,83 @@
             var item = this._pendingPromises[i];
             (function(p) {
                 p.promise.then(function(resolved) {
-                    // 将结果写入 data，触发重新渲染
-                    var updateData = {};
-                    if (p.thenVar) {
-                        updateData[p.thenVar] = resolved;
+                    if (!self._root) return;
+                    var awaitEls = self._root.querySelectorAll('s-await[data-path="' + p.awaitExpr + '"]');
+                    for (var ai = 0; ai < awaitEls.length; ai++) {
+                        var awaitEl = awaitEls[ai];
+                        var loadingBranch = awaitEl.querySelector('[data-state="loading"]');
+                        var thenBranch = awaitEl.querySelector('[data-state="then"]');
+                        var catchBranch = awaitEl.querySelector('[data-state="catch"]');
+                        if (thenBranch && loadingBranch) {
+                            var thenCtx = {};
+                            for (var k in self._data) { if (self._data.hasOwnProperty(k)) thenCtx[k] = self._data[k]; }
+                            if (p.thenVar) thenCtx[p.thenVar] = resolved;
+                            thenBranch.innerHTML = utils._processTokens(p.thenTokens, 0, thenCtx, self._onceCache, null);
+                            loadingBranch.style.display = 'none';
+                            thenBranch.style.display = '';
+                            if (catchBranch) catchBranch.style.display = 'none';
+                            // innerHTML 替换后清除查询缓存，防止返回过期 DOM 引用
+                            self._queryCache.clear();
+                        }
                     }
-                    self.update(updateData);
                 }).catch(function(err) {
-                    self._handleError(err, '#await Promise rejected');
+                    if (!self._root) return;
+                    var awaitEls = self._root.querySelectorAll('s-await[data-path="' + p.awaitExpr + '"]');
+                    for (var ai = 0; ai < awaitEls.length; ai++) {
+                        var awaitEl = awaitEls[ai];
+                        var loadingBranch = awaitEl.querySelector('[data-state="loading"]');
+                        var thenBranch = awaitEl.querySelector('[data-state="then"]');
+                        var catchBranch = awaitEl.querySelector('[data-state="catch"]');
+                        if (catchBranch && loadingBranch) {
+                            var catchCtx = {};
+                            for (var k in self._data) { if (self._data.hasOwnProperty(k)) catchCtx[k] = self._data[k]; }
+                            if (p.catchVar) catchCtx[p.catchVar] = err;
+                            catchBranch.innerHTML = utils._processTokens(p.catchTokens, 0, catchCtx, self._onceCache, null);
+                            loadingBranch.style.display = 'none';
+                            catchBranch.style.display = '';
+                            if (thenBranch) thenBranch.style.display = 'none';
+                            // innerHTML 替换后清除查询缓存
+                            self._queryCache.clear();
+                        }
+                    }
                 });
             })(item);
         }
         this._pendingPromises = [];
     };
 
-    // ----- Proxy 深响应式自动更新 -----
-    ShadowIt.prototype._makeReactive = function() {
-        // 递归代理已有数据
-        this._data = this._deepProxy(this._data);
-    };
-
-    ShadowIt.prototype._deepProxy = function(obj) {
-        if (!obj || typeof obj !== 'object') return obj;
-        // 已经代理过的跳过
-        if (obj.__sdit_proxy) return obj;
-        var self = this;
-        var handler = {
-            set: function(target, prop, value) {
-                var oldVal = target[prop];
-                if (value !== null && (typeof value === 'object')) {
-                    value = self._deepProxy(value);
-                }
-                target[prop] = value;
-                if (oldVal !== value && self._mounted && !self._destroyed) {
-                    self._scheduleUpdate();
-                }
-                return true;
-            },
-            deleteProperty: function(target, prop) {
-                if (prop in target) {
-                    delete target[prop];
-                    if (self._mounted && !self._destroyed) {
-                        self._scheduleUpdate();
-                    }
-                }
-                return true;
-            }
-        };
-        // 递归代理所有子对象
-        for (var key in obj) {
-            if (obj.hasOwnProperty(key) && obj[key] !== null && typeof obj[key] === 'object') {
-                obj[key] = self._deepProxy(obj[key]);
-            }
-        }
-        var proxy = new Proxy(obj, handler);
-        // 标记已代理（避免循环引用和重复代理）
-        Object.defineProperty(proxy, '__sdit_proxy', { value: true, enumerable: false, configurable: true });
-        return proxy;
-    };
-
-    ShadowIt.prototype._scheduleUpdate = function() {
-        if (this._updateScheduled || this._updating) return;
-        this._updateScheduled = true;
-        var self = this;
-        requestAnimationFrame(function() {
-            if (self._updateScheduled) {
-                self.update();
-            }
-        });
-    };
+    // ----- 错误处理（美化） -----
 
     ShadowIt.prototype._handleError = function(err, context) {
         try {
             var msg = err && err.message ? err.message : String(err);
             var stack = err && err.stack ? err.stack : '(no stack)';
-            console.error('[shadowit] 错误发生在 ' + context + ': ' + msg + '\n' + stack);
+            console.groupCollapsed('[shadowit] ' + (this._name || this._id) + ' - ' + context);
+            console.error(msg);
+            if (stack) console.log(stack);
+            console.groupEnd();
             if (utils.isFunction(this.options.onError)) {
                 this.options.onError(err, context);
             }
         } catch (e) {
-            // 保底：onError 本身崩溃也不影响实例状态
             console.error('[shadowit] onError 自身执行失败:', e && e.message ? e.message : e);
         }
     };
+
+    // ----- 调度更新 -----
+
+    ShadowIt.prototype._scheduleUpdate = function() {
+        if (this._updating) return;
+        this.update();
+    };
+
+    // ----- CSS -----
 
     ShadowIt.prototype._applyCSS = function() {
         if (!this._root) return this;
         var oldStyles = this._root.querySelectorAll('style[data-shadowit]');
         for (var i = 0; i < oldStyles.length; i++) oldStyles[i].remove();
         var cssVal = this.options.css;
-        // 支持 css 为函数: css: (data) => '...'，实现动态样式
         if (utils.isFunction(cssVal)) cssVal = cssVal(this._data);
         if (cssVal) {
             var styleEl = document.createElement('style');
@@ -1292,6 +1349,8 @@
         }
         return this;
     };
+
+    // ----- MutationObserver -----
 
     ShadowIt.prototype._startObserver = function() {
         if (!this._pendingSelector) return this;
@@ -1313,6 +1372,7 @@
     };
 
     // ----- 事件绑定 -----
+
     ShadowIt.prototype.on = function(event, selector, handler) {
         if (this._destroyed) return this;
         if (!this._mounted) throw new Error('[shadowit] 实例尚未挂载');
@@ -1342,7 +1402,6 @@
         for (var i = fallback.length - 1; i >= 0; i--) {
             var entry = fallback[i];
             if (entry.event !== event) continue;
-            // 精确匹配：selector 和 handler 均可选，层层过滤
             if (selector && entry.selector !== selector) continue;
             if (handler && entry.handler !== handler) continue;
             target.removeEventListener(event, entry.wrappedHandler);
@@ -1352,6 +1411,7 @@
     };
 
     // ----- 查询 -----
+
     ShadowIt.prototype.getRoot = function() { return this._root; };
     ShadowIt.prototype.getHost = function() { return this._host; };
     ShadowIt.prototype.isRendered = function() { return this._rendered; };
@@ -1375,7 +1435,6 @@
     ShadowIt.prototype.getName = function() { return this._name; };
     ShadowIt.prototype.getId = function() { return this._id; };
 
-    // 获取多宿主组中的所有实例（含自身）
     ShadowIt.prototype.getGroupInstances = function() {
         var result = [this];
         if (this._groupInstances && this._groupInstances.length > 0) {
@@ -1389,6 +1448,7 @@
     };
 
     // ----- 快捷方法 -----
+
     ShadowIt.prototype.getHTML = function() { return this._root ? this._root.innerHTML : ''; };
 
     ShadowIt.prototype.getShadowDOM = function() {
@@ -1403,6 +1463,7 @@
     };
 
     // ----- qS / qSAll (带缓存 + isConnected 自动失效) -----
+
     ShadowIt.prototype._rootKey = function(root) {
         if (root === this._root) return '__root__';
         if (!root.__sdit_ck) root.__sdit_ck = 'r' + (++ShadowIt._rootSeed);
@@ -1468,10 +1529,10 @@
         return el;
     };
 
-    // ----- destroy -----
+    // ----- destroy（含内存泄漏修复） -----
+
     ShadowIt.prototype.destroy = function() {
         if (this._destroyed) return this;
-        // 先销毁组内所有实例
         if (this._groupInstances && this._groupInstances.length > 0) {
             for (var gi = 0; gi < this._groupInstances.length; gi++) {
                 if (this._groupInstances[gi] && !this._groupInstances[gi]._destroyed) {
@@ -1486,24 +1547,24 @@
         if (this._root) { this._root.innerHTML = ''; this._root = null; }
         if (this._host) { shadowit._instances.delete(this._host); }
         if (this._name && shadowit._nameMap[this._name] === this) { delete shadowit._nameMap[this._name]; }
-        // 清理 #portal 移出的 DOM 节点
-        if (this._portalNodes && this._portalNodes.length > 0) {
-            for (var pi = 0; pi < this._portalNodes.length; pi++) {
-                var pn = this._portalNodes[pi];
-                if (pn && pn.parentNode) pn.parentNode.removeChild(pn);
-            }
-            this._portalNodes = null;
-        }
         this._host = null;
         this._destroyed = true;
         this._mounted = false;
         this._rendered = false;
+
+        // 内存泄漏修复
+        this._queryCache.clear();
+        this._queryCache = null;
+        this._bindings = null;
+        this._onceCache = null;
+        this._pendingPromises = null;
+
         return this;
     };
 
-    // ============================================================
+    // ===== Module 6: Global API =====
+
     // 全局查询
-    // ============================================================
     var _queryCache = new Map(), _cacheEnabled = false;
 
     function globalQuery(selector, root, all) {
@@ -1537,9 +1598,7 @@
         return all ? results : null;
     }
 
-    // ============================================================
     // 批处理更新（带去重）
-    // ============================================================
     var _batchMap = new Map(), _batchScheduled = false;
 
     function flushBatch() {
@@ -1552,11 +1611,7 @@
         }
     }
 
-    // ============================================================
     // 全局 shadowit 函数
-    // ============================================================
-
-    // 将混合输入（选择器字符串、Element、NodeList、数组）扁平化为 Element 数组
     shadowit._resolveHosts = function(input) {
         if (!input) return [];
         var results = [];
@@ -1590,7 +1645,6 @@
             var el = opts.el;
             if (el) {
                 var hosts = shadowit._resolveHosts(el);
-                // 从 options 中移除 el（避免污染 data）
                 var cleanOpts = {};
                 for (var k in opts) { if (k !== 'el') cleanOpts[k] = opts[k]; }
                 if (hosts.length === 0) {
@@ -1606,14 +1660,23 @@
                     var clone = new ShadowIt(hosts[i], {
                         template: firstInst.options.template,
                         css: firstInst.options.css,
-                        data: utils.deepClone(firstInst._data),
+                        setup: function() {
+                            var flat = {};
+                            var cloned = utils.deepClone(firstInst._data);
+                            for (var dk in cloned) { if (cloned.hasOwnProperty(dk)) flat[dk] = cloned[dk]; }
+                            for (var mk in firstInst._methods) { if (firstInst._methods.hasOwnProperty(mk)) flat[mk] = firstInst._methods[mk]; }
+                            flat.computed = firstInst._computed;
+                            return flat;
+                        },
                         mode: firstInst.options.mode,
-                        lifecycle: firstInst.options.lifecycle,
                         onError: firstInst.options.onError,
                         eventsOnHost: firstInst.options.eventsOnHost,
-                        methods: firstInst.options.methods,
-                        computed: firstInst.options.computed,
-                        reactive: firstInst.options.reactive
+                        beforeRender: firstInst._hooks.beforeRender,
+                        afterRender: firstInst._hooks.afterRender,
+                        beforeUpdate: firstInst._hooks.beforeUpdate,
+                        afterUpdate: firstInst._hooks.afterUpdate,
+                        shouldUpdate: firstInst._hooks.shouldUpdate,
+                        destroy: firstInst._hooks.destroy
                     });
                     firstInst._groupInstances.push(clone);
                 }
@@ -1622,7 +1685,7 @@
             return new ShadowIt(null, opts);
         }
 
-        // ---- sdit([...]) / sdit([...], {}) 数组多宿主（返回首个实例，带组追踪） ----
+        // ---- sdit([...]) / sdit([...], {}) 数组多宿主 ----
         if (utils.isArray(host) || (host && typeof host.length === 'number' && host.item)) {
             var hosts = shadowit._resolveHosts(host);
             if (hosts.length === 0) {
@@ -1638,14 +1701,23 @@
                 var clone = new ShadowIt(hosts[i], {
                     template: firstInst.options.template,
                     css: firstInst.options.css,
-                    data: utils.deepClone(firstInst._data),
+                    setup: function() {
+                        var flat = {};
+                        var cloned = utils.deepClone(firstInst._data);
+                        for (var dk in cloned) { if (cloned.hasOwnProperty(dk)) flat[dk] = cloned[dk]; }
+                        for (var mk in firstInst._methods) { if (firstInst._methods.hasOwnProperty(mk)) flat[mk] = firstInst._methods[mk]; }
+                        flat.computed = firstInst._computed;
+                        return flat;
+                    },
                     mode: firstInst.options.mode,
-                    lifecycle: firstInst.options.lifecycle,
                     onError: firstInst.options.onError,
                     eventsOnHost: firstInst.options.eventsOnHost,
-                    methods: firstInst.options.methods,
-                    computed: firstInst.options.computed,
-                    reactive: firstInst.options.reactive
+                    beforeRender: firstInst._hooks.beforeRender,
+                    afterRender: firstInst._hooks.afterRender,
+                    beforeUpdate: firstInst._hooks.beforeUpdate,
+                    afterUpdate: firstInst._hooks.afterUpdate,
+                    shouldUpdate: firstInst._hooks.shouldUpdate,
+                    destroy: firstInst._hooks.destroy
                 });
                 firstInst._groupInstances.push(clone);
             }
@@ -1702,14 +1774,12 @@
         return new ShadowIt(host, options);
     }
 
-    shadowit.version = '1.4.2';
+    shadowit.version = '2.0.0';
     shadowit.utils = utils;
     shadowit.ShadowIt = ShadowIt;
     shadowit.isSupported = isSupported;
 
-    // ============================================================
     // 实例管理
-    // ============================================================
     shadowit._instances = new WeakMap();
     shadowit._nameMap = {};
 
@@ -1783,7 +1853,7 @@
         var walk = function(node) {
             if (node.shadowRoot && node.shadowRoot.mode === 'open') {
                 if (!shadowit._instances.has(node)) {
-                    var name = node.getAttribute('data-sdit-name') || node.id ||
+                    var name = node.getAttribute('data-s-name') || node.id ||
                         (node.tagName ? node.tagName.toLowerCase() : '') + '-' + Date.now().toString(36);
                     var inst = new ShadowIt(null, { name: name });
                     inst._host = node; inst._root = node.shadowRoot;
@@ -1804,7 +1874,7 @@
         var srcEl = utils.resolveHost(source);
         if (!srcEl) return null;
         var wrapper = document.createElement('div');
-        wrapper.setAttribute('data-sdit-copy', '');
+        wrapper.setAttribute('data-s-copy', '');
         var clone = srcEl.cloneNode(true);
         wrapper.appendChild(clone);
         var shadow = wrapper.attachShadow({ mode: 'open' });
@@ -1822,9 +1892,7 @@
         return clipboard;
     };
 
-    // ============================================================
     // takeOver
-    // ============================================================
     var _takeOver = false, _origAttachShadow = null, _hijackInstalled = false;
 
     function _installHijack() {
@@ -1835,8 +1903,7 @@
             var root = _origAttachShadow.call(this, init);
             if (_takeOver && init && init.mode === 'open') {
                 if (!shadowit._instances.has(this)) {
-                    // 如果该元素已有 ShadowRoot（由其他库创建），直接关联，不重复创建实例
-                    var name = this.getAttribute('data-sdit-name') || this.id ||
+                    var name = this.getAttribute('data-s-name') || this.id ||
                         (this.tagName ? this.tagName.toLowerCase() : 'el') + '-' + Date.now().toString(36);
                     var inst = new ShadowIt(null, { name: name });
                     inst._host = this; inst._root = root;
@@ -1865,9 +1932,7 @@
         enumerable: true, configurable: false
     });
 
-    // ============================================================
     // 自定义标签注册
-    // ============================================================
     shadowit.define = function(name, tpl, css) {
         if (utils.isString(tpl) && !utils.isObject(arguments[1])) {
             var opts = { template: tpl };
@@ -1882,9 +1947,23 @@
 
         var template = options.template || '';
         var cssVal = options.css || options.styles || '';
-        var data = options.data || {};
-        var mode = options.mode || 'open';               // 支持 mode 配置
-        var lifecycle = options.lifecycle || {};
+        var setupFn = options.setup || null;
+        var setupResult = utils.isFunction(setupFn) ? setupFn() : {};
+        var initialData = {};
+        var setupMethods = {};
+        var setupComputed = {};
+        for (var dk in setupResult) {
+            if (setupResult.hasOwnProperty(dk)) {
+                if (dk === 'computed' && utils.isObject(setupResult[dk])) {
+                    setupComputed = setupResult[dk];
+                } else if (utils.isFunction(setupResult[dk])) {
+                    setupMethods[dk] = setupResult[dk];
+                } else {
+                    initialData[dk] = setupResult[dk];
+                }
+            }
+        }
+        var mode = options.mode || 'open';
         var observedAttributes = options.observedAttributes || [];
         var attributeChanged = options.attributeChanged || null;
         var connected = options.connected || null;
@@ -1897,10 +1976,12 @@
             var self = Reflect.construct(HTMLElement, [], ShadowItElement);
             self._instance = null;
             self._data = {};
-            for (var key in data) { if (data.hasOwnProperty(key)) self._data[key] = data[key]; }
+            for (var key in initialData) { if (initialData.hasOwnProperty(key)) self._data[key] = initialData[key]; }
             self._instanceName = cname || (tagName + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4));
             self._attributeChangedHandler = attributeChanged;
             self._template = template; self._css = cssVal; self._mode = mode;
+            self._setupMethods = setupMethods;
+            self._setupComputed = setupComputed;
             return self;
         }
         ShadowItElement.prototype = Object.create(HTMLElement.prototype);
@@ -1915,15 +1996,21 @@
             var self = this;
             var shadowitInst = shadowit(this, {
                 template: this._template, css: this._css, mode: this._mode,
-                data: this._data, name: this._instanceName,
+                setup: function() {
+                    var flat = {};
+                    for (var dk in self._data) { if (self._data.hasOwnProperty(dk)) flat[dk] = self._data[dk]; }
+                    for (var mk in setupMethods) { if (setupMethods.hasOwnProperty(mk)) flat[mk] = setupMethods[mk]; }
+                    flat.computed = setupComputed;
+                    return flat;
+                },
+                name: this._instanceName,
                 onError: onError, eventsOnHost: eventsOnHost,
-                lifecycle: {
-                    beforeRender: lifecycle.beforeRender ? function() { lifecycle.beforeRender.call(self); } : null,
-                    afterRender: function() { if (lifecycle.afterRender) lifecycle.afterRender.call(self, shadowitInst._data); },
-                    beforeUpdate: lifecycle.beforeUpdate ? function(newData, oldData) { lifecycle.beforeUpdate.call(self, newData, oldData); } : null,
-                    afterUpdate: lifecycle.afterUpdate ? function(newData, currentData) { lifecycle.afterUpdate.call(self, newData, currentData); } : null,
-                    destroy: function() { if (lifecycle.destroy) lifecycle.destroy.call(self); }
-                }
+                beforeRender: options.beforeRender ? function() { options.beforeRender.call(self); } : null,
+                afterRender: options.afterRender ? function(data) { options.afterRender.call(self, data); } : null,
+                beforeUpdate: options.beforeUpdate ? function(newData, oldData) { options.beforeUpdate.call(self, newData, oldData); } : null,
+                afterUpdate: options.afterUpdate ? function(newData, currentData) { options.afterUpdate.call(self, newData, currentData); } : null,
+                shouldUpdate: options.shouldUpdate ? function(newData, mergedData) { options.shouldUpdate.call(self, newData, mergedData); } : null,
+                destroy: options.destroy ? function() { options.destroy.call(self); } : null
             });
             this._instance = shadowitInst;
             if (connected) connected.call(this);
