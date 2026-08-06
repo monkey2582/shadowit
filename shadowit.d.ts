@@ -49,6 +49,16 @@ export interface ShadowItOptions {
   setup?: () => Record<string, any>;
   /** Shadow Root 模式：'open'（默认）或 'closed' */
   mode?: 'open' | 'closed';
+  /** ShadowRoot.delegatesFocus — 是否将焦点委托给第一个可聚焦子元素 */
+  delegatesFocus?: boolean;
+  /** ShadowRoot.clonable — 克隆宿主时是否克隆 ShadowRoot */
+  clonable?: boolean;
+  /** ShadowRoot.serializable — 是否允许通过 getHTML() 等方法序列化 */
+  serializable?: boolean;
+  /** ShadowRoot.slotAssignment — 'named'（默认）或 'manual' */
+  slotAssignment?: 'named' | 'manual';
+  /** ShadowRoot.customElementRegistry — 自定义元素的 CustomElementRegistry 实例 */
+  customElementRegistry?: CustomElementRegistry;
   /** 全局错误回调 */
   onError?: ((err: Error, context: string) => void) | null;
   /** 事件是否绑定在宿主元素上（默认在 Shadow Root 上） */
@@ -214,10 +224,27 @@ export interface ShadowItDefineOptions {
   setup?: () => Record<string, any>;
   /** Shadow Root 模式：'open'（默认）或 'closed' */
   mode?: 'open' | 'closed';
+  /** ShadowRoot.delegatesFocus — 是否将焦点委托给第一个可聚焦子元素 */
+  delegatesFocus?: boolean;
+  /** ShadowRoot.clonable — 克隆宿主时是否克隆 ShadowRoot */
+  clonable?: boolean;
+  /** ShadowRoot.serializable — 是否允许序列化 */
+  serializable?: boolean;
+  /** ShadowRoot.slotAssignment — 'named'（默认）或 'manual' */
+  slotAssignment?: 'named' | 'manual';
+  /** ShadowRoot.customElementRegistry — 自定义元素的 CustomElementRegistry 实例 */
+  customElementRegistry?: CustomElementRegistry;
   /** 需要监听的 HTML 属性列表 */
   observedAttributes?: string[];
-  /** 属性变化回调（未设置时自动更新到 data） */
-  attributeChanged?: ((attrName: string, oldVal: string | null, newVal: string | null) => void) | null;
+  /**
+   * 属性变化回调（未设置时自动更新到 data）
+   * @param attrName 属性名
+   * @param oldVal 旧值
+   * @param newVal 新值
+   * @param element 自定义元素 DOM 节点
+   * @param instance ShadowIt 实例
+   */
+  attributeChanged?: ((attrName: string, oldVal: string | null, newVal: string | null, element: HTMLElement, instance: ShadowItInstance) => void) | null;
   /** 元素连接到 DOM 时的回调 */
   connected?: (() => void) | null;
   /** 元素从 DOM 断开时的回调 */
@@ -327,11 +354,12 @@ export interface ShadowItFunction {
     stripComments(template: string): string;
     escapeHtml(str: any): string;
     evalCondition(expr: string, data: Record<string, any>): boolean;
-    parseTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null }>): string;
-    renderTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null }>): string;
+    _evalExpr(expr: string, data: Record<string, any>): any;
+    parseTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null; finallyTokens: any[] }>, methods?: Record<string, Function>): string;
+    renderTemplate(template: string, data: Record<string, any>, onceCache?: Record<string, string>, pendingPromises?: Array<{ promise: Promise<any>; thenTokens: any[]; thenVar: string | null; catchTokens: any[]; catchVar: string | null; finallyTokens: any[] }>, methods?: Record<string, Function>): string;
     parseEventExpr(expr: string): { name: string; args: any[] };
     _tokenize(template: string): Array<{ type: string; value?: string; name?: string; arg?: string; cond?: string | null }>;
-    _processTokens(tokens: any[], startIdx: number, data: Record<string, any>, onceCache: Record<string, string>, pendingPromises: any[] | null): string;
+    _processTokens(tokens: any[], startIdx: number, data: Record<string, any>, onceCache: Record<string, string>, pendingPromises: any[] | null, methods?: Record<string, Function>): string;
     _findClosingBraces(template: string, startPos: number): number;
   };
 

@@ -916,6 +916,11 @@
             template: options.template || '',
             css: cssVal,
             mode: options.mode || 'open',
+            delegatesFocus: options.delegatesFocus,
+            clonable: options.clonable,
+            serializable: options.serializable,
+            slotAssignment: options.slotAssignment,
+            customElementRegistry: options.customElementRegistry,
             onError: options.onError || null,
             eventsOnHost: options.eventsOnHost || false,
             name: options.name || null
@@ -970,7 +975,14 @@
     ShadowIt.prototype._mountOne = function(hostEl) {
         if (!hostEl) throw new Error('[shadowit] 宿主元素未找到');
         this._host = hostEl;
-        this._root = this._host.attachShadow({ mode: this.options.mode });
+        this._root = this._host.attachShadow({
+            mode: this.options.mode || 'open',
+            delegatesFocus: this.options.delegatesFocus,
+            clonable: this.options.clonable,
+            serializable: this.options.serializable,
+            slotAssignment: this.options.slotAssignment,
+            customElementRegistry: this.options.customElementRegistry
+        });
         this._mounted = true;
         shadowit._instances.set(this._host, this);
 
@@ -1152,6 +1164,12 @@
                     this._data[dk] = newData[dk];
                 }
             }
+            return this;
+        }
+
+        // 幽灵节点检测：宿主元素被移除时自动卸载
+        if (this._host && !this._host.isConnected) {
+            this._detachFromHost();
             return this;
         }
 
@@ -2280,6 +2298,11 @@
             }
         }
         var mode = options.mode || 'open';
+        var delegatesFocus = options.delegatesFocus;
+        var clonable = options.clonable;
+        var serializable = options.serializable;
+        var slotAssignment = options.slotAssignment;
+        var customElementRegistry = options.customElementRegistry;
         var observedAttributes = options.observedAttributes || [];
         var attributeChanged = options.attributeChanged || null;
         var connected = options.connected || null;
@@ -2296,6 +2319,11 @@
             self._instanceName = cname || (tagName + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4));
             self._attributeChangedHandler = attributeChanged;
             self._template = template; self._css = cssVal; self._mode = mode;
+            self._delegatesFocus = delegatesFocus;
+            self._clonable = clonable;
+            self._serializable = serializable;
+            self._slotAssignment = slotAssignment;
+            self._customElementRegistry = customElementRegistry;
             self._setupMethods = setupMethods;
             self._setupComputed = setupComputed;
             self._templateEl = el;
@@ -2322,6 +2350,11 @@
             }
             var shadowitInst = shadowit(this, {
                 template: tpl, css: this._css, mode: this._mode,
+                delegatesFocus: this._delegatesFocus,
+                clonable: this._clonable,
+                serializable: this._serializable,
+                slotAssignment: this._slotAssignment,
+                customElementRegistry: this._customElementRegistry,
                 setup: function() {
                     var flat = {};
                     for (var dk in self._data) { if (self._data.hasOwnProperty(dk)) flat[dk] = self._data[dk]; }
