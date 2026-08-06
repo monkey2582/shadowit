@@ -568,6 +568,8 @@
             pendingPromises = pendingPromises || null;
             methods = methods || {};
             template = utils.stripComments(template);
+            // 快速路径：模板中没有 {{ 插值语法，直接返回原样，跳过解析
+            if (template.indexOf('{{') === -1) return template;
             var tokens = utils._tokenize(template);
             return utils._processTokens(tokens, 0, data, onceCache, pendingPromises, methods);
         },
@@ -931,6 +933,15 @@
         this._methods = setupMethods;
         this._computed = setupComputed;
         
+        // 缓存高频 utils 函数引用，避免属性查找
+        this._getNested = utils.getNested;
+        this._evalExpr = utils._evalExpr;
+        this._evalCondition = utils.evalCondition;
+        this._processTokens = utils._processTokens;
+        this._escapeHtml = utils.escapeHtml;
+        this._isArray = utils.isArray;
+        this._isFunction = utils.isFunction;
+
         this._rendered = false;
         this._destroyed = false;
         this._mounted = false;
@@ -1265,17 +1276,30 @@
         var self = this;
         var structuralChange = false;
 
-        
+        // 高速缓存：局部变量引用
+        var getNested = this._getNested;
+        var evalExpr = this._evalExpr;
+        var evalCondition = this._evalCondition;
+        var processTokens = this._processTokens;
+        var onceCache = this._onceCache;
+        var methods = this._methods;
+
+        // 过滤掉已断开的节点（一次性清理）
+        var texts = bindings.texts;
+        var shows = bindings.shows;
+        var ifs = bindings.ifs;
+        var fors = bindings.fors;
+        var awaits = bindings.awaits;
 
         // texts: 直接设置 textContent（支持简单路径和复杂表达式）
-        for (var i = 0; i < bindings.texts.length; i++) {
-            var t = bindings.texts[i];
+        for (var i = 0, len = texts.length; i < len; i++) {
+            var t = texts[i];
             if (!t.node || !t.node.isConnected) continue;
             var val;
             if (t.expr) {
-                val = utils._evalExpr(t.expr, data);
+                val = evalExpr(t.expr, data);
             } else {
-                val = utils.getNested(data, t.path);
+                val = getNested(data, t.path);
             }
             var text = val !== undefined && val !== null ? String(val) : '';
             if (t.node.textContent !== text) {
@@ -1284,16 +1308,16 @@
         }
 
         // shows: 直接设置 display
-        for (var i = 0; i < bindings.shows.length; i++) {
-            var s = bindings.shows[i];
+        for (var i = 0, len = shows.length; i < len; i++) {
+            var s = shows[i];
             if (!s.node || !s.node.isConnected) continue;
-            var visible = utils.evalCondition(s.path, data);
+            var visible = evalCondition(s.path, data);
             s.node.style.display = visible ? '' : 'none';
         }
 
         // ifs: 重新渲染条件块（结构性变化）
-        for (var i = 0; i < bindings.ifs.length; i++) {
-            var ib = bindings.ifs[i];
+        for (var i = 0, len = ifs.length; i < len; i++) {
+            var ib = ifs[i];
             if (!ib.node || !ib.node.isConnected) continue;
             var newRendered = self._renderIfBlock(ib.cond, ib.tokens, data);
             if (ib.node.innerHTML !== newRendered) {
@@ -1303,15 +1327,15 @@
                 if (self._delegatedEvents) {
                     var ifNodes = ib.node.querySelectorAll('*');
                     var ifNodesArr = [];
-                    for (var ifni = 0; ifni < ifNodes.length; ifni++) ifNodesArr.push(ifNodes[ifni]);
+                    for (var ifni = 0, ifnLen = ifNodes.length; ifni < ifnLen; ifni++) ifNodesArr.push(ifNodes[ifni]);
                     self._delegatedEvents.scan(ifNodesArr);
                 }
             }
         }
 
         // fors: 键控 diff 重新渲染（结构性变化）
-        for (var i = 0; i < bindings.fors.length; i++) {
-            var fb = bindings.fors[i];
+        for (var i = 0, len = fors.length; i < len; i++) {
+            var fb = fors[i];
             if (!fb.node || !fb.node.isConnected) continue;
             // #for 的数据路径从 expr 中提取
             self._renderForBlock(fb, data);
@@ -1319,11 +1343,11 @@
         }
 
         // awaits: 变量变化后重新触发 Promise 解析
-        for (var i = 0; i < bindings.awaits.length; i++) {
-            var ab = bindings.awaits[i];
+        for (var i = 0, len = awaits.length; i < len; i++) {
+            var ab = awaits[i];
             if (!ab.node || !ab.node.isConnected) continue;
             if (ab.node.__sdit_await_done) continue;
-            var awaitVal = utils.getNested(data, ab.path);
+            var awaitVal = getNested(data, ab.path);
             if (awaitVal !== undefined && awaitVal !== null) {
                 ab.node.__sdit_await_done = true;
                 self._triggerAwait(ab, awaitVal, data);
@@ -1338,14 +1362,14 @@
         if (!tokens || tokens.length === 0) return '';
         if (cond) {
             var branches = utils._splitIfBranchesTokens(tokens, cond);
-            for (var bi = 0; bi < branches.length; bi++) {
-                if (branches[bi].condition === null || utils.evalCondition(branches[bi].condition, data)) {
-                    return utils._processTokens(branches[bi].tokens, 0, data, this._onceCache, null, this._methods);
+            for (var bi = 0, bLen = branches.length; bi < bLen; bi++) {
+                if (branches[bi].condition === null || this._evalCondition(branches[bi].condition, data)) {
+                    return this._processTokens(branches[bi].tokens, 0, data, this._onceCache, null, this._methods);
                 }
             }
             return '';
         }
-        return utils._processTokens(tokens, 0, data, this._onceCache, null, this._methods);
+        return this._processTokens(tokens, 0, data, this._onceCache, null, this._methods);
     };
 
     // 渲染 #for 块（轻量级键控 diff，使用预编译 token 数组）
@@ -1357,13 +1381,13 @@
         var itemName = forMatch[1];
         var itemsPath = forMatch[2];
         var trackKey = fb.key || null;
-        var items = utils.getNested(data, itemsPath);
-        if (!utils.isArray(items)) items = [];
+        var items = this._getNested(data, itemsPath);
+        if (!this._isArray(items)) items = [];
 
         var tokens = fb.tokens;
         var oldKeyedChildren = [];
         var oldChildren = Array.from(fb.node.childNodes);
-        for (var oi = 0; oi < oldChildren.length; oi++) {
+        for (var oi = 0, oLen = oldChildren.length; oi < oLen; oi++) {
             var oc = oldChildren[oi];
             if (oc.nodeType === 1 && oc.tagName === 'S-K') {
                 oldKeyedChildren.push({ key: oc.getAttribute('data-key'), node: oc });
@@ -1373,33 +1397,37 @@
         var keyCtxMap = {};
         var newKeyedChildren = [];
         var newHtmlParts = [];
-        for (var fi = 0; fi < items.length; fi++) {
+        var processTokens = this._processTokens;
+        var onceCache = this._onceCache;
+        var methods = this._methods;
+        var getNested = this._getNested;
+        for (var fi = 0, fiLen = items.length; fi < fiLen; fi++) {
             var listItem = items[fi];
             var ctx = {};
             for (var dk in data) { if (data.hasOwnProperty(dk)) ctx[dk] = data[dk]; }
             ctx.index = fi; ctx.parent = data; ctx[itemName] = listItem;
             var keyVal = '__idx_' + fi;
-            if (trackKey) { var k = utils.getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
+            if (trackKey) { var k = getNested(listItem, trackKey); if (k !== undefined) keyVal = k; }
             ctx['@key'] = keyVal;
             keyCtxMap[keyVal] = ctx;
-            var itemRendered = utils._processTokens(tokens, 0, ctx, this._onceCache, null, this._methods);
+            var itemRendered = processTokens(tokens, 0, ctx, onceCache, null, methods);
             newKeyedChildren.push({ key: keyVal, html: itemRendered });
             newHtmlParts.push('<s-k data-key="' + keyVal + '">' + itemRendered + '</s-k>');
         }
 
         // 轻量级键控 diff
         var oldKeyMap = {};
-        for (var oki = 0; oki < oldKeyedChildren.length; oki++) {
+        for (var oki = 0, okLen = oldKeyedChildren.length; oki < okLen; oki++) {
             oldKeyMap[oldKeyedChildren[oki].key] = oldKeyedChildren[oki].node;
         }
 
         var newKeyMap = {};
-        for (var nki = 0; nki < newKeyedChildren.length; nki++) {
+        for (var nki = 0, nkLen = newKeyedChildren.length; nki < nkLen; nki++) {
             newKeyMap[newKeyedChildren[nki].key] = true;
         }
 
         // 移除旧的不再需要的 keyed 节点
-        for (var rki = 0; rki < oldKeyedChildren.length; rki++) {
+        for (var rki = 0, rkLen = oldKeyedChildren.length; rki < rkLen; rki++) {
             if (!newKeyMap[oldKeyedChildren[rki].key]) {
                 if (oldKeyedChildren[rki].node.parentNode) {
                     oldKeyedChildren[rki].node.parentNode.removeChild(oldKeyedChildren[rki].node);
@@ -1410,7 +1438,7 @@
         // 重建子节点列表，收集新节点用于事件重扫
         var newChildList = [];
         var newNodes = [];
-        for (var nci = 0; nci < newKeyedChildren.length; nci++) {
+        for (var nci = 0, ncLen = newKeyedChildren.length; nci < ncLen; nci++) {
             var nk = newKeyedChildren[nci].key;
             var oldNode = oldKeyMap[nk];
             if (oldNode) {
@@ -1420,7 +1448,7 @@
                     oldNode.innerHTML = newKeyedChildren[nci].html;
                     // innerHTML 重建后，收集子节点及根节点用于事件重扫
                     var innerNodes = oldNode.querySelectorAll('*');
-                    for (var ini = 0; ini < innerNodes.length; ini++) {
+                    for (var ini = 0, inLen = innerNodes.length; ini < inLen; ini++) {
                         newNodes.push(innerNodes[ini]);
                     }
                     newNodes.push(oldNode);  // 根节点本身也可能带有 @click 等事件属性
@@ -1441,11 +1469,13 @@
             }
         }
 
-        // 清空并重建
+        // 清空并使用 DocumentFragment 批量重建
         while (fb.node.firstChild) { fb.node.removeChild(fb.node.firstChild); }
+        var frag = document.createDocumentFragment();
         for (var li = 0; li < newChildList.length; li++) {
-            fb.node.appendChild(newChildList[li]);
+            frag.appendChild(newChildList[li]);
         }
+        fb.node.appendChild(frag);
 
         // 重建后重新扫描事件绑定（防止 innerHTML 替换丢失 __sdit_events 标记）
         if (newNodes.length > 0 && this._delegatedEvents) {
@@ -1485,6 +1515,9 @@
     ShadowIt.prototype._resolvePendingPromises = function() {
         if (!this._pendingPromises || this._pendingPromises.length === 0) return;
         var self = this;
+        var processTokens = this._processTokens;
+        var onceCache = this._onceCache;
+        var methods = this._methods;
         for (var i = 0; i < this._pendingPromises.length; i++) {
             var item = this._pendingPromises[i];
             (function(p) {
@@ -1514,7 +1547,7 @@
                                 for (var k in self._data) { if (self._data.hasOwnProperty(k)) finallyCtx[k] = self._data[k]; }
                                 if (p.thenVar && self._data[p.thenVar] !== undefined) finallyCtx[p.thenVar] = self._data[p.thenVar];
                                 if (p.catchVar && self._data[p.catchVar] !== undefined) finallyCtx[p.catchVar] = self._data[p.catchVar];
-                                finallyBranch.innerHTML = utils._processTokens(p.finallyTokens, 0, finallyCtx, self._onceCache, null, self._methods);
+                                finallyBranch.innerHTML = processTokens(p.finallyTokens, 0, finallyCtx, onceCache, null, methods);
                             }
                             finallyBranch.style.display = '';
                             self._queryCache.clear();
@@ -1538,7 +1571,7 @@
                             var thenCtx = {};
                             for (var k in self._data) { if (self._data.hasOwnProperty(k)) thenCtx[k] = self._data[k]; }
                             if (p.thenVar) thenCtx[p.thenVar] = resolved;
-                            thenBranch.innerHTML = utils._processTokens(p.thenTokens, 0, thenCtx, self._onceCache, null, self._methods);
+                            thenBranch.innerHTML = processTokens(p.thenTokens, 0, thenCtx, onceCache, null, methods);
                             loadingBranch.style.display = 'none';
                             thenBranch.style.display = '';
                             if (catchBranch) catchBranch.style.display = 'none';
@@ -1563,7 +1596,7 @@
                             var catchCtx = {};
                             for (var k in self._data) { if (self._data.hasOwnProperty(k)) catchCtx[k] = self._data[k]; }
                             if (p.catchVar) catchCtx[p.catchVar] = err;
-                            catchBranch.innerHTML = utils._processTokens(p.catchTokens, 0, catchCtx, self._onceCache, null, self._methods);
+                            catchBranch.innerHTML = processTokens(p.catchTokens, 0, catchCtx, onceCache, null, methods);
                             loadingBranch.style.display = 'none';
                             catchBranch.style.display = '';
                             if (thenBranch) thenBranch.style.display = 'none';
@@ -1637,8 +1670,13 @@
     // ----- 调度更新 -----
 
     ShadowIt.prototype._scheduleUpdate = function() {
-        if (this._updating) return;
-        this.update();
+        if (this._updating || this._updateScheduled) return;
+        var self = this;
+        this._updateScheduled = true;
+        requestAnimationFrame(function() {
+            self._updateScheduled = false;
+            self.update();
+        });
     };
 
     // ----- CSS -----
