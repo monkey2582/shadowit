@@ -68,33 +68,39 @@ export interface ShadowItOptions {
 
   // ===== 生命周期钩子（顶层选项） =====
 
-  /** 首次渲染前调用 */
-  beforeRender?: (() => void) | null;
-  /** 首次渲染后调用，参数为当前数据对象 */
-  afterRender?: ((data: Record<string, any>) => void) | null;
+  /** 首次渲染前调用（this 指向 ShadowIt 实例） */
+  beforeRender?: ((this: ShadowItInstance, element: HTMLElement, instance: ShadowItInstance) => void) | null;
+  /** 首次渲染后调用，参数为当前数据对象（this 指向 ShadowIt 实例） */
+  afterRender?: ((this: ShadowItInstance, data: Record<string, any>, element: HTMLElement, instance: ShadowItInstance) => void) | null;
   /**
    * 每次更新前调用（数据合并前）
    * @param newData 本次更新的增量数据
    * @param oldData 更新前的数据快照（深拷贝）
+   * @param element 宿主元素 DOM 节点
+   * @param instance ShadowIt 实例
    */
-  beforeUpdate?: ((newData?: Record<string, any>, oldData?: Record<string, any> | null) => void) | null;
+  beforeUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, oldData?: Record<string, any> | null, element?: HTMLElement, instance?: ShadowItInstance) => void) | null;
   /**
    * 每次更新后调用
    * @param newData 本次更新的增量数据
    * @param currentData 更新后的当前数据
+   * @param element 宿主元素 DOM 节点
+   * @param instance ShadowIt 实例
    */
-  afterUpdate?: ((newData?: Record<string, any>, currentData?: Record<string, any>) => void) | null;
+  afterUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, currentData?: Record<string, any>, element?: HTMLElement, instance?: ShadowItInstance) => void) | null;
   /**
    * 渲染前判断钩子
    * 在数据合并后调用，此时 this._data 已是最新状态。
    * 返回 false 可跳过本次渲染（数据已合并，仅跳过 DOM 更新）。
    * @param newData 本次更新的增量数据
    * @param mergedData 合并后的最终数据
+   * @param element 宿主元素 DOM 节点
+   * @param instance ShadowIt 实例
    * @returns 是否继续渲染
    */
-  shouldUpdate?: ((newData?: Record<string, any>, mergedData?: Record<string, any>) => boolean) | null;
-  /** 实例销毁时调用 */
-  destroy?: (() => void) | null;
+  shouldUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, mergedData?: Record<string, any>, element?: HTMLElement, instance?: ShadowItInstance) => boolean) | null;
+  /** 实例销毁时调用（this 指向 ShadowIt 实例） */
+  destroy?: ((this: ShadowItInstance, element: HTMLElement, instance: ShadowItInstance) => void) | null;
 }
 
 // ============================================================
@@ -237,18 +243,18 @@ export interface ShadowItDefineOptions {
   /** 需要监听的 HTML 属性列表 */
   observedAttributes?: string[];
   /**
-   * 属性变化回调（未设置时自动更新到 data）
+   * 属性变化回调（宏任务执行，未设置时自动更新到 data）
    * @param attrName 属性名
    * @param oldVal 旧值
    * @param newVal 新值
    * @param element 自定义元素 DOM 节点
    * @param instance ShadowIt 实例
    */
-  attributeChanged?: ((attrName: string, oldVal: string | null, newVal: string | null, element: HTMLElement, instance: ShadowItInstance) => void) | null;
-  /** 元素连接到 DOM 时的回调 */
-  connected?: (() => void) | null;
-  /** 元素从 DOM 断开时的回调 */
-  disconnected?: (() => void) | null;
+  attributeChanged?: ((this: ShadowItInstance, attrName: string, oldVal: string | null, newVal: string | null, element: HTMLElement, instance: ShadowItInstance) => void) | null;
+  /** 元素连接到 DOM 时的回调（this 指向 ShadowIt 实例） */
+  connected?: ((this: ShadowItInstance) => void) | null;
+  /** 元素从 DOM 断开时的回调（this 指向 ShadowIt 实例，实例已销毁） */
+  disconnected?: ((this: ShadowItInstance) => void) | null;
   /** 实例名称 */
   name?: string | null;
   /** 全局错误回调 */
@@ -258,18 +264,18 @@ export interface ShadowItDefineOptions {
 
   // ===== 生命周期钩子（顶层选项） =====
 
-  /** 首次渲染前调用 */
-  beforeRender?: (() => void) | null;
-  /** 首次渲染后调用 */
-  afterRender?: ((data: Record<string, any>) => void) | null;
-  /** 每次更新前调用 */
-  beforeUpdate?: ((newData?: Record<string, any>, oldData?: Record<string, any> | null) => void) | null;
-  /** 每次更新后调用 */
-  afterUpdate?: ((newData?: Record<string, any>, currentData?: Record<string, any>) => void) | null;
-  /** 渲染前判断钩子，返回 false 跳过渲染 */
-  shouldUpdate?: ((newData?: Record<string, any>, mergedData?: Record<string, any>) => boolean) | null;
-  /** 实例销毁时调用 */
-  destroy?: (() => void) | null;
+  /** 首次渲染前调用（this 指向 ShadowIt 实例） */
+  beforeRender?: ((this: ShadowItInstance, element: HTMLElement, instance: ShadowItInstance) => void) | null;
+  /** 首次渲染后调用（this 指向 ShadowIt 实例） */
+  afterRender?: ((this: ShadowItInstance, data: Record<string, any>, element: HTMLElement, instance: ShadowItInstance) => void) | null;
+  /** 每次更新前调用（this 指向 ShadowIt 实例） */
+  beforeUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, oldData?: Record<string, any> | null, element?: HTMLElement, instance?: ShadowItInstance) => void) | null;
+  /** 每次更新后调用（this 指向 ShadowIt 实例） */
+  afterUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, currentData?: Record<string, any>, element?: HTMLElement, instance?: ShadowItInstance) => void) | null;
+  /** 渲染前判断钩子，返回 false 跳过渲染（this 指向 ShadowIt 实例） */
+  shouldUpdate?: ((this: ShadowItInstance, newData?: Record<string, any>, mergedData?: Record<string, any>, element?: HTMLElement, instance?: ShadowItInstance) => boolean) | null;
+  /** 实例销毁时调用（this 指向 ShadowIt 实例） */
+  destroy?: ((this: ShadowItInstance, element: HTMLElement, instance: ShadowItInstance) => void) | null;
 }
 
 // ============================================================

@@ -1190,9 +1190,9 @@
         var oldData = isFirstRender ? null : utils.deepClone(this._data);
         try {
             if (isFirstRender) {
-                this._callHook('beforeRender');
+                this._callHook('beforeRender', this._host, this);
             } else {
-                this._callHook('beforeUpdate', newData, oldData);
+                this._callHook('beforeUpdate', newData, oldData, this._host, this);
             }
 
             if (utils.isObject(newData)) {
@@ -1203,7 +1203,7 @@
             }
 
             if (!isFirstRender && utils.isFunction(this._hooks.shouldUpdate)) {
-                if (!this._hooks.shouldUpdate.call(this, newData, this._data)) {
+                if (!this._hooks.shouldUpdate.call(this, newData, this._data, this._host, this)) {
                     this._updating = false;
                     return this;
                 }
@@ -1247,7 +1247,7 @@
                 if (shadowit._cacheEnabled) shadowit.clearQueryCache();
                 this._resolvePendingPromises();
 
-                this._callHook('afterRender', this._data);
+                this._callHook('afterRender', this._data, this._host, this);
             } else {
                 // 后续更新：使用绑定系统直接操作 DOM
                 var structuralChange = this._applyBindings(this._bindings);
@@ -1258,7 +1258,7 @@
                     if (shadowit._cacheEnabled) shadowit.clearQueryCache();
                 }
 
-                this._callHook('afterUpdate', newData, this._data);
+                this._callHook('afterUpdate', newData, this._data, this._host, this);
             }
         } catch (err) {
             this._handleError(err, isFirstRender ? 'render' : 'update');
@@ -1887,7 +1887,7 @@
             }
             this._groupInstances = null;
         }
-        try { this._callHook('destroy'); }
+        try { this._callHook('destroy', this._host, this); }
         catch (err) { this._handleError(err, 'destroy'); }
         if (this._delegatedEvents) { this._delegatedEvents.destroy(); this._delegatedEvents = null; }
         if (this._root) { this._root.innerHTML = ''; this._root = null; }
@@ -2402,20 +2402,21 @@
                 },
                 name: this._instanceName,
                 onError: onError, eventsOnHost: eventsOnHost,
-                beforeRender: options.beforeRender ? function() { options.beforeRender.call(self); } : null,
-                afterRender: options.afterRender ? function(data) { options.afterRender.call(self, data); } : null,
-                beforeUpdate: options.beforeUpdate ? function(newData, oldData) { options.beforeUpdate.call(self, newData, oldData); } : null,
-                afterUpdate: options.afterUpdate ? function(newData, currentData) { options.afterUpdate.call(self, newData, currentData); } : null,
-                shouldUpdate: options.shouldUpdate ? function(newData, mergedData) { options.shouldUpdate.call(self, newData, mergedData); } : null,
-                destroy: options.destroy ? function() { options.destroy.call(self); } : null
+                beforeRender: options.beforeRender ? function() { options.beforeRender.call(shadowitInst, self, shadowitInst); } : null,
+                afterRender: options.afterRender ? function(data) { options.afterRender.call(shadowitInst, data, self, shadowitInst); } : null,
+                beforeUpdate: options.beforeUpdate ? function(newData, oldData) { options.beforeUpdate.call(shadowitInst, newData, oldData, self, shadowitInst); } : null,
+                afterUpdate: options.afterUpdate ? function(newData, currentData) { options.afterUpdate.call(shadowitInst, newData, currentData, self, shadowitInst); } : null,
+                shouldUpdate: options.shouldUpdate ? function(newData, mergedData) { options.shouldUpdate.call(shadowitInst, newData, mergedData, self, shadowitInst); } : null,
+                destroy: options.destroy ? function() { options.destroy.call(shadowitInst, self, shadowitInst); } : null
             });
             this._instance = shadowitInst;
-            if (connected) connected.call(this);
+            if (connected) connected.call(shadowitInst, self, shadowitInst);
         };
 
         ShadowItElement.prototype.disconnectedCallback = function() {
-            if (this._instance) { this._instance.destroy(); this._instance = null; }
-            if (disconnected) disconnected.call(this);
+            var inst = this._instance;
+            if (inst) { inst.destroy(); this._instance = null; }
+            if (disconnected) disconnected.call(inst, this, inst);
         };
 
         ShadowItElement.prototype.attributeChangedCallback = function(attrName, oldVal, newVal) {
