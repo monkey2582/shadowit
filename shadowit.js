@@ -2421,7 +2421,10 @@
         ShadowItElement.prototype.attributeChangedCallback = function(attrName, oldVal, newVal) {
             if (oldVal === newVal) return;
             if (this._attributeChangedHandler) {
-                this._attributeChangedHandler.call(this._instance, attrName, oldVal, newVal, this, this._instance);
+                var self = this;
+                setTimeout(function() {
+                    self._attributeChangedHandler.call(self._instance, attrName, oldVal, newVal, self, self._instance);
+                }, 0);
             } else {
                 if (this._instance) { var d = {}; d[attrName] = newVal; this._instance.update(d); }
                 else { this._data[attrName] = newVal; }
